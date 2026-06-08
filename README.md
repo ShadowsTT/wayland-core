@@ -122,7 +122,7 @@ A single agent is the floor, not the ceiling. Wayland Core fans work out across 
 
 <div align="center">
 
-![Wayland Core spawning a parallel research swarm](docs/img/screenshot-spawn-running.png)
+![Fleet spawn fan-out — one orchestrator, isolated workers, merged result](docs/img/diagram-swarm.png)
 
 </div>
 
@@ -144,6 +144,12 @@ Security is a default, not a setting, and it is built to hold up when someone re
 
 <div align="center">
 
+![Security: fail-closed — sandbox plus one CI-enforced egress gate](docs/img/diagram-security.png)
+
+</div>
+
+<div align="center">
+
 ![Security and sandboxing, compared](docs/img/compare-security.png)
 
 </div>
@@ -151,6 +157,12 @@ Security is a default, not a setting, and it is built to hold up when someone re
 ## Built to endure
 
 Most agent demos prove an agent can finish a task. The harder question is whether one can run unattended for a long time, on its own codebase, surviving crashes and injected faults without ever drifting or corrupting its state. We are putting Wayland Core through exactly that, as an open endurance trial.
+
+<div align="center">
+
+![Resilience under fire — WAL, retry, and checkpoint recovering through deliberate kills](docs/img/diagram-resilience.png)
+
+</div>
 
 **Measured so far** (one continuous 12-hour unattended run):
 
@@ -199,6 +211,12 @@ The host sends `Message` / `SetConfig` / `SetMode` / `Stop` commands and receive
 ## Architecture
 
 A workspace of focused crates. Dependencies flow strictly downward; the engine only ever sees provider-neutral types, and format conversion lives inside each provider.
+
+<div align="center">
+
+![One engine, many surfaces — CLI, TUI, JSON stream, and an embedded host all driving the same core](docs/img/diagram-architecture.png)
+
+</div>
 
 | Layer | Crates | Responsibility |
 |-------|--------|----------------|
