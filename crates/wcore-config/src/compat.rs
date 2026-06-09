@@ -92,6 +92,21 @@ pub struct ProviderCompat {
 
     /// W6 F7 — USD per cached input token written (cache creation).
     pub cost_per_cache_write_token: Option<f64>,
+
+    /// Whether the destination endpoint optimizes request *input* server-side.
+    ///
+    /// - `Some("router")` — the endpoint is a routing layer (e.g. a Flux- or
+    ///   OpenRouter-class server-side router) that performs its own input
+    ///   optimization before forwarding to the upstream model. When set, the
+    ///   engine should *defer* client-side token-optimization passes to avoid
+    ///   doing redundant (and potentially conflicting) work.
+    /// - `Some("client")` / `None` — the endpoint is a direct provider that
+    ///   expects the client to optimize input itself; client-side passes run.
+    ///
+    /// This is a vendor-neutral *capability* flag — it records only what the
+    /// endpoint does, not any product-specific behaviour. No billing, savings,
+    /// or arbitrage logic lives here.
+    pub input_optimization: Option<String>,
 }
 
 impl ProviderCompat {
@@ -236,8 +251,18 @@ impl ProviderCompat {
     /// keyed by `provider_type` (the real id), which now matches the
     /// `[<provider>.<model>]` rows in `pricing.toml`.
     pub(crate) fn openai_compat_provider(provider_id: &str) -> Self {
+        // Server-side routing layers optimize input upstream; mark them
+        // `"router"` so the engine defers client-side optimization passes.
+        // Plain OpenAI-compat *providers* (Together, Groq, Deepseek, …) do NOT
+        // route — they leave this `None` (→ "client"). This is the single,
+        // vendor-neutral place that classifies a router vs. a direct provider.
+        let input_optimization = match provider_id {
+            "flux-router" | "openrouter" => Some("router".to_string()),
+            _ => None,
+        };
         Self {
             provider_type: Some(provider_id.into()),
+            input_optimization,
             // F-026 fix: use Some(0.0) as a sentinel meaning "pricing
             // resolves via catalog; emit cost events but report $0 when the
             // catalog has no entry for this model". Previously these were
@@ -397,6 +422,7 @@ impl ProviderCompat {
             cost_per_cache_write_token: user
                 .cost_per_cache_write_token
                 .or(defaults.cost_per_cache_write_token),
+            input_optimization: user.input_optimization.or(defaults.input_optimization),
         }
     }
 
@@ -456,6 +482,13 @@ impl ProviderCompat {
     /// `TurnTrace.provider` and by `wcore-observability::cost::estimate_turn_cost`.
     pub fn provider_type(&self) -> &str {
         self.provider_type.as_deref().unwrap_or("unknown")
+    }
+
+    /// Resolved input-optimization capability. `"router"` means the endpoint
+    /// optimizes input server-side (defer client-side passes); `"client"`
+    /// (the default when unset) means the client must optimize itself.
+    pub fn input_optimization(&self) -> &str {
+        self.input_optimization.as_deref().unwrap_or("client")
     }
 }
 
@@ -1013,5 +1046,96 @@ mod d2_tier2_provider_cost_tests {
         assert_eq!(c.provider_type(), "openai");
         // Some(0.0): cost attribution gate fires; catalog provides real rates.
         assert!(c.cost_per_input_token.is_some());
+    }
+}
+
+// --- route-gate: input_optimization capability flag ---
+//
+// `input_optimization` records whether the destination endpoint optimizes
+// request input server-side (a router) or expects the client to do it (a
+// direct provider). It gates client-side token-optimization passes elsewhere
+// in the engine. Vendor-neutral capability — no billing/savings/arbitrage.
+#[cfg(test)]
+mod input_optimization_tests {
+    use super::*;
+
+    /// Flux Router is a server-side routing layer → "router".
+    #[test]
+    fn flux_router_preset_is_router() {
+        let c = ProviderCompat::flux_router_defaults();
+        assert_eq!(c.input_optimization, Some("router".to_string()));
+        assert_eq!(c.input_optimization(), "router");
+    }
+
+    /// OpenRouter is a genuine server-side router (non-owned vendor) → "router".
+    /// A reviewer grepping "router" must find at least two distinct vendors.
+    #[test]
+    fn openrouter_preset_is_router() {
+        let c = ProviderCompat::openrouter_defaults();
+        assert_eq!(c.input_optimization, Some("router".to_string()));
+        assert_eq!(c.input_optimization(), "router");
+    }
+
+    /// Direct providers leave the flag unset → accessor resolves to "client".
+    #[test]
+    fn direct_providers_are_client() {
+        // OpenAI direct.
+        let openai = ProviderCompat::openai_defaults();
+        assert_eq!(openai.input_optimization, None);
+        assert_eq!(openai.input_optimization(), "client");
+
+        // Anthropic direct.
+        let anthropic = ProviderCompat::anthropic_defaults();
+        assert_eq!(anthropic.input_optimization, None);
+        assert_eq!(anthropic.input_optimization(), "client");
+    }
+
+    /// Plain OpenAI-compat *providers* (not routers) stay "client" even though
+    /// they share the `openai_compat_provider()` constructor with the routers.
+    #[test]
+    fn openai_compat_non_routers_are_client() {
+        for c in [
+            ProviderCompat::together_defaults(),
+            ProviderCompat::groq_defaults(),
+            ProviderCompat::deepseek_defaults(),
+        ] {
+            assert_eq!(
+                c.input_optimization,
+                None,
+                "provider {} is a direct provider, not a router",
+                c.provider_type()
+            );
+            assert_eq!(c.input_optimization(), "client");
+        }
+    }
+
+    /// The accessor defaults to "client" when the flag is entirely unset.
+    #[test]
+    fn accessor_defaults_to_client_when_none() {
+        let c = ProviderCompat::default();
+        assert_eq!(c.input_optimization, None);
+        assert_eq!(c.input_optimization(), "client");
+    }
+
+    /// A user-set `Some` wins over the preset default through `merge()`.
+    #[test]
+    fn merge_user_input_optimization_overrides_default() {
+        // User forces "router" on a direct provider that defaults to None.
+        let defaults = ProviderCompat::openai_defaults();
+        let user = ProviderCompat {
+            input_optimization: Some("router".to_string()),
+            ..ProviderCompat::default()
+        };
+        let merged = ProviderCompat::merge(defaults, user);
+        assert_eq!(merged.input_optimization, Some("router".to_string()));
+        assert_eq!(merged.input_optimization(), "router");
+    }
+
+    /// An empty user keeps the router default (here: a router preset).
+    #[test]
+    fn merge_empty_user_keeps_router_default() {
+        let defaults = ProviderCompat::flux_router_defaults();
+        let merged = ProviderCompat::merge(defaults, ProviderCompat::default());
+        assert_eq!(merged.input_optimization(), "router");
     }
 }
