@@ -88,6 +88,59 @@ Notes:
 
 ---
 
+## Acknowledgements — reactions & typing
+
+So a sender knows the bot heard them, set the per-channel `ack` mode:
+
+```toml
+[inbound]
+ack = "both"   # off (default) | reactions | typing | both
+```
+
+- `reactions` — the bot reacts 👀 when it receives your message, then ✅ on
+  success or ❌ on failure.
+- `typing` — the bot shows a "typing…" indicator, refreshed every 5s while
+  it works.
+- `both` — reactions + typing.
+
+Best-effort: a connector without the platform API simply does nothing
+(Telegram implements both today; other connectors fall back to no-op until
+implemented). Ack failures never affect the reply itself.
+
+## Inbound webhook host (Slack / WhatsApp / Twilio SMS)
+
+Slack, WhatsApp, and Twilio SMS receive inbound messages as HTTP webhooks
+rather than by polling. Enable the receiver:
+
+```toml
+# main config (not the per-channel file)
+[inbound_webhook]
+enabled = true
+bind = "127.0.0.1:8787"
+# REQUIRED for Twilio signature verification (it signs the public URL);
+# set to the exact public https URL the platform calls:
+public_base_url = "https://bot.example.com"
+```
+
+Point each platform's webhook at `https://bot.example.com/webhooks/<channel-name>`
+(the `<channel-name>` is the config file stem). Each connector verifies its
+platform signature before accepting a message. (MS Teams inbound is parsed
+but **not** exposed over the host yet — its Bot Framework JWT validation is
+a pending follow-up.)
+
+## Not yet built (channel parity follow-ups)
+
+- Message **edit / delete** surfaces on the `Channel` trait.
+- **Multi-agent conversation-binding**: each conversation already gets its
+  own isolated session/engine; binding *distinct agent configs* per
+  conversation/peer is not built.
+- A **setup doctor / token-probe** CLI to validate channel config and
+  credentials interactively.
+- Outbound **idempotency nonces** (the inbound dedup already prevents
+  double-processing of platform replays).
+- MS Teams inbound webhook **JWT/JWKS** validation (parse exists; host
+  exposure gated until then).
+
 ## Recommended deployment baseline
 
 ```toml
