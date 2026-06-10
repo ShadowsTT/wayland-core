@@ -123,7 +123,9 @@ async fn try_ripgrep(
     case_insensitive: bool,
 ) -> Result<ToolResult, std::io::Error> {
     let mut cmd = Command::new("rg");
-    cmd.arg(pattern).arg(path).arg("-n");
+    // `--no-config` ignores RIPGREP_CONFIG_PATH / .ripgreprc, which could
+    // otherwise inject flags (e.g. `--pre`) into this agent-driven invocation.
+    cmd.arg("--no-config").arg("-n");
 
     if let Some(g) = glob_pattern {
         cmd.arg("--glob").arg(g);
@@ -131,6 +133,11 @@ async fn try_ripgrep(
     if case_insensitive {
         cmd.arg("-i");
     }
+
+    // `--` terminates option parsing: a model-supplied pattern such as
+    // `--pre=<cmd>` is then treated as a search pattern, not a ripgrep flag
+    // (which would otherwise allow arbitrary per-file command execution).
+    cmd.arg("--").arg(pattern).arg(path);
 
     let output = cmd.output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -172,10 +179,13 @@ async fn try_grep(pattern: &str, path: &str, case_insensitive: bool) -> ToolResu
         c
     } else {
         let mut c = Command::new("grep");
-        c.arg("-rn").arg(pattern).arg(path);
+        c.arg("-rn");
         if case_insensitive {
             c.arg("-i");
         }
+        // `--` stops option parsing so a pattern beginning with `-` cannot be
+        // interpreted as a grep flag.
+        c.arg("--").arg(pattern).arg(path);
         c
     };
 

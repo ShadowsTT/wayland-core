@@ -127,7 +127,16 @@ fn format_plugin_rules(rules: &[RuleSpec], cwd: &str) -> String {
         return String::new();
     }
 
-    applied.join("\n\n")
+    // Rule content is contributed by installed plugins (register_rules). Defang
+    // any forged host trust tags so a rule cannot impersonate or break out of
+    // the host framing, and label provenance so plugin rules are
+    // distinguishable from core host instructions.
+    let joined = applied
+        .iter()
+        .map(|c| wcore_config::hooks::neutralize_trust_delimiters(c))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!("The following operating rules were contributed by installed plugins:\n\n{joined}")
 }
 
 /// Build the system prompt from config and environment.
@@ -289,7 +298,13 @@ pub fn build_system_prompt(
 
     if !visible_skills.is_empty() {
         let skills_section = cache.sections.entry("skills").or_insert_with(|| {
-            let listing = format_skills_within_budget(&visible_skills, context_window_tokens);
+            // Skill name/description come from plugins/MCP resources (untrusted).
+            // Defang any forged host trust tags (e.g. a skill named
+            // `</system-reminder>...`) before embedding in the system prompt,
+            // matching the hook/memory sinks (hooks/mod.rs, engine.rs).
+            let listing = wcore_config::hooks::neutralize_trust_delimiters(
+                &format_skills_within_budget(&visible_skills, context_window_tokens),
+            );
             if listing.is_empty() {
                 String::new()
             } else {

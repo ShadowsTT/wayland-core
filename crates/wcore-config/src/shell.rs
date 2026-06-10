@@ -69,6 +69,32 @@ pub async fn shell_command(command_str: &str) -> std::io::Result<Output> {
     shell_command_builder(command_str).output().await
 }
 
+/// Shell-string mode for **hook commands**, which reference hook variables as
+/// `${VAR}` and expect them expanded from the environment.
+///
+/// Identical to [`shell_command_builder`] except that on Windows it enables
+/// delayed expansion (`cmd /V:ON /C`) so a hook author's `!VAR!` reference is
+/// expanded at execution time WITHOUT the shell re-parsing the (model-derived)
+/// value for metacharacters. On Unix, `sh -c` expands `${VAR}` from the
+/// environment safely (parameter expansion is not re-evaluated for command
+/// substitution). Either way, callers MUST pass hook values via `.envs(...)`
+/// and never interpolate a value into `command_str` — see the hook runner,
+/// which translates `${VAR}` to the platform-native safe reference.
+pub fn hook_shell_command_builder(command_str: &str) -> Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.arg("/V:ON").arg("/C").arg(command_str);
+        c
+    } else {
+        let info = shell_info();
+        let mut c = Command::new(info.program);
+        c.arg(info.flag).arg(command_str);
+        c
+    };
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// Argv mode: spawn `program` directly with each `arg` passed as a
 /// separate process-arg. No shell interpreter is invoked, so shell
 /// metacharacters in `args` are NEVER interpreted by a shell. The OS
