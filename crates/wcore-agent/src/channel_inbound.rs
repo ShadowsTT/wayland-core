@@ -33,14 +33,14 @@
 //! emitted between `start_all` and `spawn` are lost.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use wcore_channels::{
-    evaluate, ChannelEvent, ChannelManager, DedupeCache, InboundPolicy, IncomingMessage,
-    OutgoingMessage, TurnAdmission,
+    ChannelEvent, ChannelManager, DedupeCache, InboundPolicy, IncomingMessage, OutgoingMessage,
+    TurnAdmission, evaluate,
 };
 
 /// Seam between the inbound subscriber and the agent engine.
@@ -222,7 +222,11 @@ impl InboundSubscriber {
 
                                 drop(_typing_guard);
                                 if ack.reactions() {
-                                    let emoji = if dispatch_result.is_ok() { "✅" } else { "❌" };
+                                    let emoji = if dispatch_result.is_ok() {
+                                        "✅"
+                                    } else {
+                                        "❌"
+                                    };
                                     let g = manager.lock().await;
                                     let _ = g
                                         .react_on(
@@ -348,9 +352,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use wcore_channels::{
-        Channel, ChannelError, ChatType, DmPolicy, MessageReceipt,
-    };
+    use wcore_channels::{Channel, ChannelError, ChatType, DmPolicy, MessageReceipt};
 
     /// Shared outbound log handle — what a `CapturingChannel` records.
     type OutboundLog = Arc<Mutex<Vec<OutgoingMessage>>>;
@@ -553,8 +555,7 @@ mod tests {
         let mut q = VecDeque::new();
         q.push_back(dm("m1"));
 
-        let (manager, outbound, calls, count, handle) =
-            harness("slack", q, policies, |_| {}).await;
+        let (manager, outbound, calls, count, handle) = harness("slack", q, policies, |_| {}).await;
 
         // Wait for the dispatcher to be called and the reply to be sent.
         let dispatched = wait_for_len(&calls, 1, Duration::from_secs(2)).await;
@@ -567,10 +568,7 @@ mod tests {
         let calls = calls.lock().await;
         assert_eq!(
             calls[0],
-            (
-                "agent:main:slack:dm:c1".to_string(),
-                "slack".to_string()
-            )
+            ("agent:main:slack:dm:c1".to_string(), "slack".to_string())
         );
 
         let out = outbound.lock().await;
@@ -589,8 +587,7 @@ mod tests {
         let mut q = VecDeque::new();
         q.push_back(dm("m1"));
 
-        let (manager, outbound, calls, count, handle) =
-            harness("slack", q, policies, |_| {}).await;
+        let (manager, outbound, calls, count, handle) = harness("slack", q, policies, |_| {}).await;
 
         // Give the loop ample time to process and (not) dispatch.
         let dispatched = wait_for_len(&calls, 1, Duration::from_millis(500)).await;
@@ -641,8 +638,7 @@ mod tests {
         let mut q = VecDeque::new();
         q.push_back(self_msg);
 
-        let (manager, outbound, calls, count, handle) =
-            harness("slack", q, policies, |_| {}).await;
+        let (manager, outbound, calls, count, handle) = harness("slack", q, policies, |_| {}).await;
 
         let dispatched = wait_for_len(&calls, 1, Duration::from_millis(500)).await;
 
@@ -663,11 +659,10 @@ mod tests {
         q.push_back(dm("m1"));
 
         // Flip the kill switch OFF before the event is injected/processed.
-        let (manager, outbound, calls, count, handle) =
-            harness("slack", q, policies, |sub| {
-                sub.kill_switch().store(false, Ordering::Relaxed);
-            })
-            .await;
+        let (manager, outbound, calls, count, handle) = harness("slack", q, policies, |sub| {
+            sub.kill_switch().store(false, Ordering::Relaxed);
+        })
+        .await;
 
         let dispatched = wait_for_len(&calls, 1, Duration::from_millis(500)).await;
 

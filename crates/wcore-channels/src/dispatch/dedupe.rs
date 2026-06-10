@@ -222,7 +222,10 @@ mod tests {
         assert!(c.check(key("m1"), 0));
         assert!(!c.check(key("m1"), 999), "still live just under ttl");
         // At exactly ttl the age == ttl, which is NOT < ttl -> expired.
-        assert!(c.check(key("m1"), 1000), "expired at the ttl boundary -> new again");
+        assert!(
+            c.check(key("m1"), 1000),
+            "expired at the ttl boundary -> new again"
+        );
     }
 
     #[test]
@@ -230,7 +233,10 @@ mod tests {
         let mut c = DedupeCache::new(0, 100);
         assert!(c.check(key("m1"), 0));
         // Arbitrarily far in the future, still a duplicate.
-        assert!(!c.check(key("m1"), u64::MAX), "ttl=0 means entries never age out");
+        assert!(
+            !c.check(key("m1"), u64::MAX),
+            "ttl=0 means entries never age out"
+        );
     }
 
     #[test]

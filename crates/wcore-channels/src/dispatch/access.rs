@@ -457,9 +457,10 @@ mod tests {
         let p: InboundPolicy = toml::from_str("dm = \"open\"").unwrap();
         assert_eq!(p.tools, ChannelToolPosture::Conversational);
         // Each posture string round-trips.
-        let w: InboundPolicy =
-            toml::from_str("dm = \"open\"\ntools = \"workspace\"\ntool_workspace_root = \"/srv/agent\"")
-                .unwrap();
+        let w: InboundPolicy = toml::from_str(
+            "dm = \"open\"\ntools = \"workspace\"\ntool_workspace_root = \"/srv/agent\"",
+        )
+        .unwrap();
         assert_eq!(w.tools, ChannelToolPosture::Workspace);
         assert_eq!(w.tool_workspace_root.as_deref(), Some("/srv/agent"));
         let f: InboundPolicy = toml::from_str("dm = \"open\"\ntools = \"full\"").unwrap();

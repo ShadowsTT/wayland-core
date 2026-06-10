@@ -188,7 +188,10 @@ fn push_assistant_items(input: &mut Vec<Value>, msg: &Message) {
 
     for block in &msg.content {
         if let ContentBlock::ToolUse {
-            id, name, input: args, ..
+            id,
+            name,
+            input: args,
+            ..
         } = block
         {
             input.push(json!({
@@ -549,7 +552,10 @@ fn update_usage(state: &mut ResponsesStreamState, response: Option<&Value>) {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     state.input_tokens = input.saturating_sub(cached);
     state.cache_read_tokens = cached;
     state.output_tokens = usage
@@ -589,7 +595,10 @@ fn map_responses_finish(status: Option<&str>) -> FinishReason {
 
 /// Format a Responses error object (`{ code, message }`) into a string.
 fn format_responses_error(error: &Value) -> String {
-    let code = error.get("code").and_then(Value::as_str).unwrap_or("unknown");
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -707,7 +716,9 @@ mod tests {
     fn build_input_assistant_text_is_output_text() {
         let assistant = Message::new(
             Role::Assistant,
-            vec![ContentBlock::Text { text: "the answer".into() }],
+            vec![ContentBlock::Text {
+                text: "the answer".into(),
+            }],
         );
         let input = build_input(&[assistant]);
         assert_eq!(input.len(), 1);
@@ -750,7 +761,9 @@ mod tests {
             other => panic!("expected TextDelta, got {other:?}"),
         }
         match &got[1] {
-            LlmEvent::ToolUse { id, name, input, .. } => {
+            LlmEvent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "read");
                 assert_eq!(input, &json!({ "path": "a.txt" }));
@@ -789,7 +802,11 @@ mod tests {
         ));
         assert!(matches!(got[0], LlmEvent::TextDelta(_)));
         match &got[1] {
-            LlmEvent::Done { stop_reason, finish_reason, .. } => {
+            LlmEvent::Done {
+                stop_reason,
+                finish_reason,
+                ..
+            } => {
                 assert_eq!(*stop_reason, StopReason::EndTurn);
                 assert_eq!(*finish_reason, FinishReason::Stop);
             }
@@ -877,7 +894,11 @@ mod tests {
             &mut state,
         );
         match &events[0] {
-            LlmEvent::Done { stop_reason, finish_reason, .. } => {
+            LlmEvent::Done {
+                stop_reason,
+                finish_reason,
+                ..
+            } => {
                 assert_eq!(*stop_reason, StopReason::MaxTokens);
                 assert_eq!(*finish_reason, FinishReason::Length);
             }

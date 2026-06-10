@@ -179,10 +179,7 @@ impl AgentBootstrap {
     /// its per-session engines; the local CLI/TUI/json-stream engines leave
     /// this `None` and keep the full toolset. See
     /// [`crate::channel_tools::apply_posture`].
-    pub fn channel_tool_posture(
-        mut self,
-        scope: crate::channel_tools::ChannelToolScope,
-    ) -> Self {
+    pub fn channel_tool_posture(mut self, scope: crate::channel_tools::ChannelToolScope) -> Self {
         self.channel_tool_posture = Some(scope);
         self
     }
@@ -2211,13 +2208,11 @@ impl AgentBootstrap {
                     })
                     .collect();
 
-                let policies: std::collections::HashMap<
-                    String,
-                    wcore_channels::InboundPolicy,
-                > = channel_configs
-                    .into_iter()
-                    .map(|c| (c.name, c.inbound))
-                    .collect();
+                let policies: std::collections::HashMap<String, wcore_channels::InboundPolicy> =
+                    channel_configs
+                        .into_iter()
+                        .map(|c| (c.name, c.inbound))
+                        .collect();
 
                 let dispatcher: Arc<dyn crate::channel_inbound::TurnDispatcher> =
                     Arc::new(crate::channel_dispatch::ChannelTurnDispatcher::new(

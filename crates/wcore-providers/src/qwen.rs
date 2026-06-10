@@ -33,8 +33,7 @@ use crate::{LlmProvider, ProviderError};
 /// Targets the INTERNATIONAL host (`dashscope-intl.aliyuncs.com`). Mainland-China
 /// users reach the `dashscope.aliyuncs.com` endpoint via the `alibaba-cn`
 /// catalog alias.
-pub const QWEN_DEFAULT_BASE_URL: &str =
-    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+pub const QWEN_DEFAULT_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 
 /// Qwen provider — delegates to [`OpenAIProvider`] over DashScope's
 /// OpenAI-compatible endpoint.

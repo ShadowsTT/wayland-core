@@ -192,7 +192,9 @@ pub fn parse_webhook(raw_body: &str) -> Result<Vec<ChannelEvent>, WhatsappError>
                 .and_then(|m| m.phone_number_id.clone());
             // Destructure before the consuming loop so both fields are
             // accessible inside it without a partial-move error.
-            let ChangeValue { contacts, messages, .. } = value;
+            let ChangeValue {
+                contacts, messages, ..
+            } = value;
 
             for raw in messages {
                 let kind = raw.kind.as_deref().unwrap_or("text");
@@ -201,71 +203,68 @@ pub fn parse_webhook(raw_body: &str) -> Result<Vec<ChannelEvent>, WhatsappError>
                 // WhatsApp Cloud API returns a media id rather than a direct
                 // URL; we store it as the `url` field (prefixed with the
                 // media id) for the fetching layer to resolve.
-                let (body, attachments): (String, Vec<Attachment>) = match kind {
-                    "text" => {
-                        let text = raw
-                            .text
-                            .as_ref()
-                            .and_then(|t| t.body.clone())
-                            .unwrap_or_default();
-                        (text, Vec::new())
-                    }
-                    "image" => {
-                        let att = raw.image.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
-                            Attachment {
-                                url: id.to_string(),
-                                kind: MediaKind::Image,
-                                ..Default::default()
-                            }
-                        });
-                        (String::new(), att.into_iter().collect())
-                    }
-                    "audio" => {
-                        let att =
-                            raw.audio.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
+                let (body, attachments): (String, Vec<Attachment>) =
+                    match kind {
+                        "text" => {
+                            let text = raw
+                                .text
+                                .as_ref()
+                                .and_then(|t| t.body.clone())
+                                .unwrap_or_default();
+                            (text, Vec::new())
+                        }
+                        "image" => {
+                            let att = raw.image.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
+                                Attachment {
+                                    url: id.to_string(),
+                                    kind: MediaKind::Image,
+                                    ..Default::default()
+                                }
+                            });
+                            (String::new(), att.into_iter().collect())
+                        }
+                        "audio" => {
+                            let att = raw.audio.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
                                 Attachment {
                                     url: id.to_string(),
                                     kind: MediaKind::Audio,
                                     ..Default::default()
                                 }
                             });
-                        (String::new(), att.into_iter().collect())
-                    }
-                    "video" => {
-                        let att =
-                            raw.video.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
+                            (String::new(), att.into_iter().collect())
+                        }
+                        "video" => {
+                            let att = raw.video.as_ref().and_then(|m| m.id.as_deref()).map(|id| {
                                 Attachment {
                                     url: id.to_string(),
                                     kind: MediaKind::Video,
                                     ..Default::default()
                                 }
                             });
-                        (String::new(), att.into_iter().collect())
-                    }
-                    "document" => {
-                        let att =
-                            raw.document
-                                .as_ref()
-                                .and_then(|m| m.id.as_deref())
-                                .map(|id| Attachment {
-                                    url: id.to_string(),
-                                    kind: MediaKind::Document,
-                                    ..Default::default()
-                                });
-                        (String::new(), att.into_iter().collect())
-                    }
-                    _ => {
-                        // Status events / interactive replies / stickers etc. —
-                        // surface as PlatformWarning so the engine sees they
-                        // arrived without failing the whole envelope.
-                        out.push(ChannelEvent::PlatformWarning {
-                            message: format!(
-                                "ignored non-text whatsapp message kind={kind}"
-                            ),
-                        });
-                        continue;
-                    }
-                };
+                            (String::new(), att.into_iter().collect())
+                        }
+                        "document" => {
+                            let att =
+                                raw.document
+                                    .as_ref()
+                                    .and_then(|m| m.id.as_deref())
+                                    .map(|id| Attachment {
+                                        url: id.to_string(),
+                                        kind: MediaKind::Document,
+                                        ..Default::default()
+                                    });
+                            (String::new(), att.into_iter().collect())
+                        }
+                        _ => {
+                            // Status events / interactive replies / stickers etc. —
+                            // surface as PlatformWarning so the engine sees they
+                            // arrived without failing the whole envelope.
+                            out.push(ChannelEvent::PlatformWarning {
+                                message: format!("ignored non-text whatsapp message kind={kind}"),
+                            });
+                            continue;
+                        }
+                    };
 
                 let from = raw.from.clone().unwrap_or_else(|| "unknown".to_string());
                 let id = raw.id.unwrap_or_default();
@@ -486,10 +485,7 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             ChannelEvent::MessageReceived { msg } => {
-                assert_eq!(
-                    msg.reply_to_message_id.as_deref(),
-                    Some("wamid.ORIGINAL")
-                );
+                assert_eq!(msg.reply_to_message_id.as_deref(), Some("wamid.ORIGINAL"));
                 assert!(msg.reply_to_text.is_none());
             }
             other => panic!("expected MessageReceived, got {other:?}"),

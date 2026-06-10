@@ -780,7 +780,9 @@ parse_mode = "MarkdownV2"
                 "big_id".into(),
             ))
             .with_status(200)
-            .with_body(r#"{"ok":true,"result":{"file_id":"big_id","file_path":"photos/file_0.jpg"}}"#)
+            .with_body(
+                r#"{"ok":true,"result":{"file_id":"big_id","file_path":"photos/file_0.jpg"}}"#,
+            )
             .expect_at_least(1)
             .create_async()
             .await;
@@ -928,10 +930,7 @@ parse_mode = "MarkdownV2"
     async fn send_typing_before_start_errors_not_started() {
         let creds = InMemoryCreds::with_token("telegram.test.bot_token", TEST_TOKEN);
         let ch = TelegramChannel::with_api_base("test", cfg(), creds, "http://unused".to_string());
-        let err = ch
-            .send_typing("42")
-            .await
-            .expect_err("expected NotStarted");
+        let err = ch.send_typing("42").await.expect_err("expected NotStarted");
         assert!(matches!(err, ChannelError::NotStarted), "got {err:?}");
     }
 
@@ -992,7 +991,9 @@ parse_mode = "MarkdownV2"
             .await
             .expect_err("expected Rejected for bad message_id");
         match err {
-            ChannelError::Rejected(msg) => assert!(msg.contains("invalid message_id"), "msg = {msg}"),
+            ChannelError::Rejected(msg) => {
+                assert!(msg.contains("invalid message_id"), "msg = {msg}")
+            }
             other => panic!("expected Rejected, got {other:?}"),
         }
         ch.stop().await.unwrap();

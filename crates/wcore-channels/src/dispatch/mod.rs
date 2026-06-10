@@ -24,10 +24,10 @@ pub mod dedupe;
 pub mod session_key;
 
 pub use access::{
-    decide_access, AccessDecision, AckMode, ChannelToolPosture, DmPolicy, GroupPolicy,
-    InboundPolicy,
+    AccessDecision, AckMode, ChannelToolPosture, DmPolicy, GroupPolicy, InboundPolicy,
+    decide_access,
 };
-pub use admission::{classify, TurnAdmission};
+pub use admission::{TurnAdmission, classify};
 pub use dedupe::{DedupeCache, DedupeKey};
 pub use session_key::build_session_key;
 
@@ -140,7 +140,10 @@ mod tests {
             }
         );
         assert!(out.session_key.is_none());
-        assert!(out.deny_reason.is_some(), "fail-closed deny carries a reason");
+        assert!(
+            out.deny_reason.is_some(),
+            "fail-closed deny carries a reason"
+        );
     }
 
     #[test]
@@ -152,7 +155,10 @@ mod tests {
         let mut c = cache();
         let out = evaluate("slack", &dm("u1", "m1"), &policy, &mut c, 0);
         assert_eq!(out.admission, TurnAdmission::Dispatch);
-        assert_eq!(out.session_key.as_deref(), Some("agent:main:slack:dm:conv1"));
+        assert_eq!(
+            out.session_key.as_deref(),
+            Some("agent:main:slack:dm:conv1")
+        );
         assert!(out.deny_reason.is_none());
     }
 

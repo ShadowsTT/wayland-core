@@ -83,7 +83,9 @@ impl ToolRegistry {
             }
             keep_it
         });
-        self.breakers.write().retain(|name, _| kept_names.contains(name));
+        self.breakers
+            .write()
+            .retain(|name, _| kept_names.contains(name));
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -429,7 +431,11 @@ mod tests {
     #[test]
     fn retain_drops_unmatched_tools_and_prunes_breakers() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool_with_category("Read", "fs read", ToolCategory::Info));
+        registry.register(make_tool_with_category(
+            "Read",
+            "fs read",
+            ToolCategory::Info,
+        ));
         registry.register(make_tool_with_category("Bash", "shell", ToolCategory::Exec));
         registry.register(make_tool_with_category("web", "net", ToolCategory::Info));
 
@@ -452,7 +458,10 @@ mod tests {
     #[test]
     fn tool_vfs_defaults_none_and_round_trips() {
         let mut registry = ToolRegistry::new();
-        assert!(registry.tool_vfs().is_none(), "default is unconfined RealFs");
+        assert!(
+            registry.tool_vfs().is_none(),
+            "default is unconfined RealFs"
+        );
         registry.set_tool_vfs(Arc::new(crate::vfs::RealFs));
         assert!(registry.tool_vfs().is_some(), "installed vfs is observable");
     }

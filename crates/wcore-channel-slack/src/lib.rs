@@ -278,19 +278,14 @@ impl Channel for SlackChannel {
     /// runs the signing-secret HMAC + timestamp window). A
     /// `url_verification` challenge surfaces as a `200` echoing the
     /// challenge string; everything else is an empty `200`.
-    async fn ingest_webhook(
-        &self,
-        req: &WebhookRequest,
-    ) -> Result<WebhookResponse, ChannelError> {
+    async fn ingest_webhook(&self, req: &WebhookRequest) -> Result<WebhookResponse, ChannelError> {
         let (sig, ts) = match (
             req.header("x-slack-signature"),
             req.header("x-slack-request-timestamp"),
         ) {
             (Some(sig), Some(ts)) => (sig, ts),
             _ => {
-                return Err(ChannelError::Auth(
-                    "missing slack signature headers".into(),
-                ));
+                return Err(ChannelError::Auth("missing slack signature headers".into()));
             }
         };
         match self.ingest_event(&req.body, sig, ts).await {

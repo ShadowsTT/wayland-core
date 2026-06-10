@@ -201,7 +201,9 @@ async fn sync_once(
         .query(&query)
         // HTTP read timeout = long-poll wait + buffer so we don't hang
         // forever on a misbehaving proxy.
-        .timeout(Duration::from_millis(SYNC_TIMEOUT_MS.saturating_add(10_000)))
+        .timeout(Duration::from_millis(
+            SYNC_TIMEOUT_MS.saturating_add(10_000),
+        ))
         .send()
         .await
         .map_err(|e| MatrixError::Network(e.to_string()))?;
@@ -421,7 +423,10 @@ mod tests {
         let ChannelEvent::MessageReceived { msg } = &events[0] else {
             panic!("expected MessageReceived");
         };
-        assert!(msg.was_mentioned, "m.mentions of the bot must set was_mentioned");
+        assert!(
+            msg.was_mentioned,
+            "m.mentions of the bot must set was_mentioned"
+        );
     }
 
     // 5. Empty /sync (no joined rooms) yields no events.

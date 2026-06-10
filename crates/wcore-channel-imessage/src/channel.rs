@@ -186,9 +186,14 @@ impl Channel for IMessageChannel {
         result.map_err(ChannelError::from)?;
 
         let ts_secs = chrono::Utc::now().timestamp();
-        let id =
-            resolve_sent_guid(db_path, pre_send_rowid, &msg.conversation_id, &msg.text, ts_secs)
-                .await;
+        let id = resolve_sent_guid(
+            db_path,
+            pre_send_rowid,
+            &msg.conversation_id,
+            &msg.text,
+            ts_secs,
+        )
+        .await;
 
         Ok(MessageReceipt {
             id,

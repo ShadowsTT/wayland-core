@@ -27,9 +27,9 @@ pub mod webhook;
 pub use chunk::chunk_message;
 pub use config::{ChannelConfig, ChannelConfigLoader};
 pub use dispatch::{
-    build_session_key, classify, decide_access, evaluate, AccessDecision, AckMode,
-    ChannelToolPosture, DedupeCache, DedupeKey, DispatchOutcome, DmPolicy, GroupPolicy,
-    InboundPolicy, TurnAdmission,
+    AccessDecision, AckMode, ChannelToolPosture, DedupeCache, DedupeKey, DispatchOutcome, DmPolicy,
+    GroupPolicy, InboundPolicy, TurnAdmission, build_session_key, classify, decide_access,
+    evaluate,
 };
 pub use error::ChannelError;
 pub use event::{
@@ -139,10 +139,7 @@ pub trait Channel: Send + Sync {
     /// Takes `&self` (not `&mut self`): connectors enqueue through their
     /// interior-mutable inbox, so the host can ingest concurrently with
     /// the poll loop without an exclusive borrow.
-    async fn ingest_webhook(
-        &self,
-        _req: &WebhookRequest,
-    ) -> Result<WebhookResponse, ChannelError> {
+    async fn ingest_webhook(&self, _req: &WebhookRequest) -> Result<WebhookResponse, ChannelError> {
         Err(ChannelError::Rejected(
             "channel does not accept inbound webhooks".to_string(),
         ))

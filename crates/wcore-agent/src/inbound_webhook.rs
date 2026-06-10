@@ -24,13 +24,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use wcore_channels::{ChannelError, ChannelManager, WebhookRequest, WebhookResponse};
 use wcore_config::config::InboundWebhookConfig;
 
@@ -170,7 +170,12 @@ async fn handle_webhook(
         body,
     );
 
-    let result = state.manager.lock().await.ingest_webhook(&channel, &req).await;
+    let result = state
+        .manager
+        .lock()
+        .await
+        .ingest_webhook(&channel, &req)
+        .await;
     response_for(&channel, result)
 }
 
@@ -361,7 +366,10 @@ mod tests {
         let mut hm = HeaderMap::new();
         hm.insert("X-Slack-Signature", "v0=abc".parse().unwrap());
         let pairs = collect_headers(&hm);
-        assert_eq!(pairs, vec![("x-slack-signature".to_string(), "v0=abc".to_string())]);
+        assert_eq!(
+            pairs,
+            vec![("x-slack-signature".to_string(), "v0=abc".to_string())]
+        );
     }
 
     #[test]

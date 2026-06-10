@@ -168,13 +168,7 @@ pub fn activity_to_incoming(
         // Teams does not echo the bot's own outbound back to its endpoint,
         // so there is no reliable self-loop to guard here; leave is_self
         // false. Attachments are deferred to a follow-up (see module docs).
-        ..IncomingMessage::new(
-            activity.id,
-            conversation_id,
-            author,
-            activity.text,
-            ts_secs,
-        )
+        ..IncomingMessage::new(activity.id, conversation_id, author, activity.text, ts_secs)
     };
 
     Ok(Some(msg))
@@ -279,7 +273,8 @@ mod tests {
 
     #[test]
     fn malformed_json_errors() {
-        let err = activity_to_incoming("{ not json", SERVICE_FALLBACK).expect_err("bad json errors");
+        let err =
+            activity_to_incoming("{ not json", SERVICE_FALLBACK).expect_err("bad json errors");
         assert!(matches!(err, MsTeamsError::Parse(_)), "got {err:?}");
     }
 }

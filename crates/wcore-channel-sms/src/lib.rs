@@ -274,13 +274,10 @@ impl Channel for SmsChannel {
     /// public URL Twilio called (see the host's `public_base_url`). Pulls
     /// the `X-Twilio-Signature` header and delegates to
     /// [`Self::ingest_twilio_webhook`].
-    async fn ingest_webhook(
-        &self,
-        req: &WebhookRequest,
-    ) -> Result<WebhookResponse, ChannelError> {
-        let sig = req.header("x-twilio-signature").ok_or_else(|| {
-            ChannelError::Auth("missing twilio signature header".into())
-        })?;
+    async fn ingest_webhook(&self, req: &WebhookRequest) -> Result<WebhookResponse, ChannelError> {
+        let sig = req
+            .header("x-twilio-signature")
+            .ok_or_else(|| ChannelError::Auth("missing twilio signature header".into()))?;
         match self
             .ingest_twilio_webhook(&req.full_url, &req.body, sig)
             .await

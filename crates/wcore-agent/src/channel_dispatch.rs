@@ -102,12 +102,13 @@ impl ChannelTurnDispatcher {
     /// Resolve the tool scope for `channel_name`, defaulting to the safe
     /// `Conversational` posture rooted at `cwd` for an unconfigured channel.
     fn scope_for(&self, channel_name: &str) -> ChannelToolScope {
-        self.postures.get(channel_name).cloned().unwrap_or_else(|| {
-            ChannelToolScope {
+        self.postures
+            .get(channel_name)
+            .cloned()
+            .unwrap_or_else(|| ChannelToolScope {
                 posture: ChannelToolPosture::Conversational,
                 workspace_root: std::path::PathBuf::from(&self.cwd),
-            }
-        })
+            })
     }
 
     /// Map a kernel session key (e.g. `agent:main:slack:dm:c1`) to a session
@@ -330,9 +331,14 @@ mod tests {
     fn hashed_session_id_matches_session_manager_pattern() {
         // The SessionManager accepts only `[a-f0-9-]{6,40}`.
         let id = ChannelTurnDispatcher::hashed_session_id("agent:main:telegram:group:42");
-        assert!(id.len() >= 6 && id.len() <= 40, "len {} out of bounds", id.len());
         assert!(
-            id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            id.len() >= 6 && id.len() <= 40,
+            "len {} out of bounds",
+            id.len()
+        );
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "id must be lowercase hex: {id}"
         );
     }

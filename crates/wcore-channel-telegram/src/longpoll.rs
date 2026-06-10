@@ -229,7 +229,13 @@ async fn ingest_updates(
                     .unwrap_or_else(|| sid.clone());
                 (sid, author, display_name, f.username.clone(), f.is_bot)
             } else {
-                ("unknown".to_string(), "unknown".to_string(), None, None, false)
+                (
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    None,
+                    None,
+                    false,
+                )
             };
 
         // ---- Chat type ----------------------------------------------
@@ -267,10 +273,7 @@ async fn ingest_updates(
             .reply_to_message
             .as_deref()
             .map(|r| r.message_id.to_string());
-        let reply_to_text = msg
-            .reply_to_message
-            .as_deref()
-            .and_then(|r| r.text.clone());
+        let reply_to_text = msg.reply_to_message.as_deref().and_then(|r| r.text.clone());
 
         let text = msg.text.unwrap_or_default();
 

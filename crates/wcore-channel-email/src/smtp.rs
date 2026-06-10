@@ -138,7 +138,11 @@ pub(crate) fn build_reply_subject(original: Option<&str>) -> String {
                 && b[0].eq_ignore_ascii_case(&b'r')
                 && b[1].eq_ignore_ascii_case(&b'e')
                 && b[2] == b':';
-            if is_re { s.to_string() } else { format!("Re: {s}") }
+            if is_re {
+                s.to_string()
+            } else {
+                format!("Re: {s}")
+            }
         }
         None => "Re:".to_string(),
     }
@@ -387,8 +391,14 @@ mod tests {
             // Outcome below must NOT be consumed.
             RecordingSender::ok_with_queue_id("Q3"),
         ]);
-        let msg =
-            build_message("bot@acme.com", "ops@acme.com", "should not retry", None, None).unwrap();
+        let msg = build_message(
+            "bot@acme.com",
+            "ops@acme.com",
+            "should not retry",
+            None,
+            None,
+        )
+        .unwrap();
         let err = send_with_retry(sender.clone(), msg)
             .await
             .expect_err("auth");
@@ -446,7 +456,10 @@ mod tests {
     fn reply_subject_prefixes_re_once() {
         assert_eq!(build_reply_subject(Some("Hello there")), "Re: Hello there");
         // Already-Re subject is not double-prefixed (case-insensitive).
-        assert_eq!(build_reply_subject(Some("Re: Hello there")), "Re: Hello there");
+        assert_eq!(
+            build_reply_subject(Some("Re: Hello there")),
+            "Re: Hello there"
+        );
         assert_eq!(build_reply_subject(Some("RE: shouting")), "RE: shouting");
         assert_eq!(build_reply_subject(Some("re: lower")), "re: lower");
         // Whitespace-only / empty / unknown fall back to a bare "Re:".

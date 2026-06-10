@@ -134,7 +134,7 @@ fn fetch_outgoing_since_blocking(
     since_rowid: i64,
     chat_id: &str,
 ) -> Result<Vec<OutgoingRow>, IMessageError> {
-    use rusqlite::{params, Connection, OpenFlags};
+    use rusqlite::{Connection, OpenFlags, params};
 
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| IMessageError::Database(format!("open chat.db: {e}")))?;

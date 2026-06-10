@@ -425,7 +425,10 @@ mod tests {
         fn new(
             name: &str,
             cap: usize,
-        ) -> (Self, std::sync::Arc<tokio::sync::Mutex<Vec<OutgoingMessage>>>) {
+        ) -> (
+            Self,
+            std::sync::Arc<tokio::sync::Mutex<Vec<OutgoingMessage>>>,
+        ) {
             let sent = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
             (
                 Self {
@@ -618,9 +621,7 @@ mod tests {
                         ChannelEvent::ConnectionStateChanged {
                             state: ConnectionState::Reconnecting,
                         } => saw_reconnecting = true,
-                        ChannelEvent::MessageReceived { ref msg }
-                            if msg.text == "back online" =>
-                        {
+                        ChannelEvent::MessageReceived { ref msg } if msg.text == "back online" => {
                             saw_recovery_msg = true;
                         }
                         _ => {}

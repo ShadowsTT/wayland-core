@@ -287,7 +287,10 @@ mod tests {
         let msg = pairs_to_incoming(&pairs).unwrap();
         assert_eq!(msg.attachments.len(), 2);
         assert_eq!(msg.attachments[0].url, "https://api.twilio.com/a.jpg");
-        assert_eq!(msg.attachments[0].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            msg.attachments[0].content_type.as_deref(),
+            Some("image/jpeg")
+        );
         assert_eq!(msg.attachments[0].kind, MediaKind::Image);
         assert_eq!(msg.attachments[1].url, "https://api.twilio.com/b.jpg");
         assert_eq!(msg.attachments[1].content_type, None);

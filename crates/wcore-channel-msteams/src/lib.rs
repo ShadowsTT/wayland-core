@@ -477,7 +477,8 @@ service_url = "https://smba.trafficmanager.net/emea/"
     #[tokio::test]
     async fn ingest_activity_ignores_conversation_update() {
         let mut ch = MsTeamsChannel::new("test", cfg(), MemCreds::empty());
-        let body = r#"{ "type": "conversationUpdate", "id": "x", "conversation": { "id": "19:abc" } }"#;
+        let body =
+            r#"{ "type": "conversationUpdate", "id": "x", "conversation": { "id": "19:abc" } }"#;
         ch.ingest_activity(body).await.unwrap();
         assert!(ch.poll_events().await.unwrap().is_empty());
     }

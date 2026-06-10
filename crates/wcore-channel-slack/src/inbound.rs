@@ -111,9 +111,7 @@ fn parse_inner_event(ev: &serde_json::Value) -> Result<Parsed, SlackError> {
                         MediaKind::Video
                     } else if mime.starts_with("audio/") {
                         MediaKind::Audio
-                    } else if mime.starts_with("application/")
-                        || mime.starts_with("text/")
-                    {
+                    } else if mime.starts_with("application/") || mime.starts_with("text/") {
                         MediaKind::Document
                     } else {
                         MediaKind::Other
@@ -139,10 +137,7 @@ fn parse_inner_event(ev: &serde_json::Value) -> Result<Parsed, SlackError> {
     // Slack channel_type values: "im" (1:1 DM), "mpim" (multi-person DM),
     // "channel" (public), "group" (private channel).
     // Channel id prefixes: D = im, G = group/mpim, C = public channel.
-    let chat_type = match ev
-        .get("channel_type")
-        .and_then(|v| v.as_str())
-    {
+    let chat_type = match ev.get("channel_type").and_then(|v| v.as_str()) {
         Some("im") => ChatType::Direct,
         Some("mpim") => ChatType::Group,
         Some("channel" | "group") => ChatType::Channel,
@@ -159,9 +154,7 @@ fn parse_inner_event(ev: &serde_json::Value) -> Result<Parsed, SlackError> {
     // message IS the root; otherwise it's a reply within that thread.
     let thread_ts = ev.get("thread_ts").and_then(|v| v.as_str());
     let thread_id = thread_ts.map(str::to_owned);
-    let reply_to_message_id = thread_ts
-        .filter(|&tts| tts != ts_str)
-        .map(str::to_owned);
+    let reply_to_message_id = thread_ts.filter(|&tts| tts != ts_str).map(str::to_owned);
 
     // --- Bot flag ---
     // `bot_message` subtype is already filtered above (returns Ignored).

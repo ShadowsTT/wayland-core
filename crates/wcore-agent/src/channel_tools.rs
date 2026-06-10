@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use wcore_channels::ChannelToolPosture;
 use wcore_protocol::events::ToolCategory;
-use wcore_tools::registry::ToolRegistry;
 use wcore_tools::Tool;
+use wcore_tools::registry::ToolRegistry;
 
 /// Resolved tool posture for one channel: the posture plus the concrete
 /// workspace root the `Workspace` jail confines filesystem tools to.
@@ -112,8 +112,10 @@ pub fn apply_posture(registry: &mut ToolRegistry, scope: &ChannelToolScope) {
         registry.retain(|t| keep_under(posture, t));
     }
     if scope.posture == ChannelToolPosture::Workspace {
-        let jail =
-            wcore_tools::vfs::SandboxedFs::new(wcore_tools::vfs::RealFs, scope.workspace_root.clone());
+        let jail = wcore_tools::vfs::SandboxedFs::new(
+            wcore_tools::vfs::RealFs,
+            scope.workspace_root.clone(),
+        );
         registry.set_tool_vfs(Arc::new(jail));
     }
 }
@@ -251,7 +253,8 @@ mod tests {
     #[test]
     fn conversational_keeps_safe_and_mcp_tools() {
         for t in builtin_roster() {
-            if CONVERSATIONAL_SAFE.contains(&t.name()) || matches!(t.category(), ToolCategory::Mcp) {
+            if CONVERSATIONAL_SAFE.contains(&t.name()) || matches!(t.category(), ToolCategory::Mcp)
+            {
                 assert!(
                     keep_under(ChannelToolPosture::Conversational, &t),
                     "safe/mcp tool '{}' must survive conversational posture",
@@ -266,17 +269,30 @@ mod tests {
         // The five vfs-jailable fs tools come back…
         for name in WORKSPACE_FS_TOOLS {
             assert!(
-                keep_under(ChannelToolPosture::Workspace, &tool(name, ToolCategory::Info)),
+                keep_under(
+                    ChannelToolPosture::Workspace,
+                    &tool(name, ToolCategory::Info)
+                ),
                 "workspace must expose vfs-jailable fs tool '{name}'"
             );
         }
         // …but shell/exec, non-vfs fs readers, AND the shell-out search
         // tools (Grep/Glob — not confined by the vfs jail) stay dropped.
         for name in [
-            "Bash", "Git", "RepoMap", "pdf_extract", "kubectl", "Script", "Grep", "Glob",
+            "Bash",
+            "Git",
+            "RepoMap",
+            "pdf_extract",
+            "kubectl",
+            "Script",
+            "Grep",
+            "Glob",
         ] {
             assert!(
-                !keep_under(ChannelToolPosture::Workspace, &tool(name, ToolCategory::Info)),
+                !keep_under(
+                    ChannelToolPosture::Workspace,
+                    &tool(name, ToolCategory::Info)
+                ),
                 "workspace must NOT expose host-escaping tool '{name}'"
             );
         }
@@ -301,7 +317,10 @@ mod tests {
             workspace_root: PathBuf::from("/tmp"),
         };
         apply_posture(&mut reg, &scope);
-        assert!(reg.tool_vfs().is_some(), "workspace posture pins a SandboxedFs jail");
+        assert!(
+            reg.tool_vfs().is_some(),
+            "workspace posture pins a SandboxedFs jail"
+        );
     }
 
     #[test]

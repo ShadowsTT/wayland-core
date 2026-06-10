@@ -1466,7 +1466,10 @@ mod tests {
     /// arbitrary slices to also exercise mid-delimiter chunk boundaries.
     /// Returns the forwarded events plus the terminal outcome the real
     /// function would derive from `final_finish_reason` / `error_seen`.
-    fn drive_stream(raw: &[u8], chunk_size: usize) -> (Vec<LlmEvent>, Result<Option<LlmEvent>, ()>) {
+    fn drive_stream(
+        raw: &[u8],
+        chunk_size: usize,
+    ) -> (Vec<LlmEvent>, Result<Option<LlmEvent>, ()>) {
         let mut state = GeminiStreamState::default();
         let mut buffer = String::new();
         let mut events: Vec<LlmEvent> = Vec::new();
@@ -1495,8 +1498,7 @@ mod tests {
 
         // Terminal logic, identical to `process_sse_stream`'s tail.
         if let Some(raw) = state.final_finish_reason.take() {
-            let (stop_reason, finish_reason) =
-                map_gemini_finish_reason(&raw, state.saw_tool_call);
+            let (stop_reason, finish_reason) = map_gemini_finish_reason(&raw, state.saw_tool_call);
             let done = LlmEvent::Done {
                 stop_reason,
                 finish_reason,
@@ -1529,8 +1531,7 @@ mod tests {
 
     #[test]
     fn drain_complete_frames_leaves_partial_trailing_frame_buffered() {
-        let mut buffer =
-            "data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\ndata: {\"c\":".to_string();
+        let mut buffer = "data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\ndata: {\"c\":".to_string();
         let payloads = drain_complete_frames(&mut buffer);
         assert_eq!(payloads, vec!["{\"a\":1}", "{\"b\":2}"]);
         // The incomplete third frame is retained for the next chunk.
@@ -1606,8 +1607,7 @@ mod tests {
 
     #[test]
     fn crlf_thinking_tool_call_stream_emits_thinking_tooluse_and_tool_stop() {
-        let (events, terminal) =
-            drive_stream(GEMINI_25_FLASH_CRLF_TOOLCALL_SSE.as_bytes(), 4096);
+        let (events, terminal) = drive_stream(GEMINI_25_FLASH_CRLF_TOOLCALL_SSE.as_bytes(), 4096);
 
         assert!(
             events
@@ -1615,7 +1615,10 @@ mod tests {
                 .any(|e| matches!(e, LlmEvent::ThinkingDelta(t) if t == "Planning the call.")),
             "thought part must surface as ThinkingDelta, got {events:?}"
         );
-        match events.iter().find(|e| matches!(e, LlmEvent::ToolUse { .. })) {
+        match events
+            .iter()
+            .find(|e| matches!(e, LlmEvent::ToolUse { .. }))
+        {
             Some(LlmEvent::ToolUse {
                 name, input, extra, ..
             }) => {
@@ -1665,8 +1668,7 @@ mod tests {
     fn genuinely_truncated_crlf_stream_still_errors() {
         // A real dropped stream (text frame, then nothing — no finishReason)
         // must NOT be masked. The fix only stops FALSE truncation reports.
-        let truncated =
-            "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"par\"}],\"role\": \"model\"},\"index\": 0}]}\r\n\r\n";
+        let truncated = "data: {\"candidates\": [{\"content\": {\"parts\": [{\"text\": \"par\"}],\"role\": \"model\"},\"index\": 0}]}\r\n\r\n";
         let (events, terminal) = drive_stream(truncated.as_bytes(), 4096);
         assert!(
             events

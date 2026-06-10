@@ -856,7 +856,10 @@ send_timeout_secs = 20
         );
         io.write_line(&resp).await;
 
-        let receipt = send_fut.await.unwrap().expect("partial should still succeed");
+        let receipt = send_fut
+            .await
+            .unwrap()
+            .expect("partial should still succeed");
         assert_eq!(receipt.id, "1700000123456");
     }
 
@@ -890,12 +893,10 @@ send_timeout_secs = 20
         ) -> Result<SignalProcessHandle, SignalError> {
             self.launches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let h = self
-                .queue
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| SignalError::Spawn("respawn launcher: queue exhausted".into()))?;
+            let h =
+                self.queue.lock().unwrap().pop_front().ok_or_else(|| {
+                    SignalError::Spawn("respawn launcher: queue exhausted".into())
+                })?;
             Ok(SignalProcessHandle {
                 stdin: Box::new(h.stdin),
                 stdout: Box::new(BufReader::new(h.stdout)),

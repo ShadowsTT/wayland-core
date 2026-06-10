@@ -647,7 +647,9 @@ fn parse_content_type(headers: &[String]) -> ContentType {
 /// Extract a `Content-Type` parameter (e.g. `boundary`, `name`) from the
 /// full header value list.
 fn ct_param(headers: &[String], param: &str) -> Option<String> {
-    let raw = headers.iter().find_map(|h| header_value(h, "Content-Type"))?;
+    let raw = headers
+        .iter()
+        .find_map(|h| header_value(h, "Content-Type"))?;
     ct_param_in(raw, param)
 }
 
@@ -1054,7 +1056,11 @@ Content-Type: text/html; charset=utf-8\r\n\
         // Subject still prepended.
         assert!(m.text.starts_with("Hi"), "text = {:?}", m.text);
         // Tags stripped.
-        assert!(!m.text.contains('<'), "text should have no tags: {:?}", m.text);
+        assert!(
+            !m.text.contains('<'),
+            "text should have no tags: {:?}",
+            m.text
+        );
     }
 
     #[test]
@@ -1106,8 +1112,14 @@ aGVsbG8=\r\n\
 
     #[test]
     fn attachment_kind_maps_from_content_type() {
-        assert_eq!(attachment_from("image/jpeg", "a.jpg").kind, MediaKind::Image);
-        assert_eq!(attachment_from("audio/mpeg", "a.mp3").kind, MediaKind::Audio);
+        assert_eq!(
+            attachment_from("image/jpeg", "a.jpg").kind,
+            MediaKind::Image
+        );
+        assert_eq!(
+            attachment_from("audio/mpeg", "a.mp3").kind,
+            MediaKind::Audio
+        );
         assert_eq!(attachment_from("video/mp4", "a.mp4").kind, MediaKind::Video);
         assert_eq!(
             attachment_from("application/pdf", "a.pdf").kind,
@@ -1145,8 +1157,16 @@ Content-Transfer-Encoding: quoted-printable\r\n\
         let text = html_to_text(html);
         assert!(text.contains("A & B"), "text = {:?}", text);
         assert!(text.contains("line two"), "text = {:?}", text);
-        assert!(!text.contains("evil"), "script body must be dropped: {:?}", text);
-        assert!(!text.contains("color:red"), "style body must be dropped: {:?}", text);
+        assert!(
+            !text.contains("evil"),
+            "script body must be dropped: {:?}",
+            text
+        );
+        assert!(
+            !text.contains("color:red"),
+            "style body must be dropped: {:?}",
+            text
+        );
     }
 
     #[test]

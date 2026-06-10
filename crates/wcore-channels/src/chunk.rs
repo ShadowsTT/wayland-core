@@ -116,7 +116,10 @@ mod tests {
         // 8 multi-byte chars; cap 3 → chunks of 3,3,2 chars, all valid UTF-8.
         let s = "αβγδεζηθ";
         let out = chunk_message(s, 3);
-        assert_eq!(out.iter().map(|c| c.chars().count()).collect::<Vec<_>>(), vec![3, 3, 2]);
+        assert_eq!(
+            out.iter().map(|c| c.chars().count()).collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
         assert_eq!(out.concat(), s);
     }
 

@@ -275,10 +275,7 @@ impl Channel for WhatsappChannel {
     ///     challenge is echoed back verbatim; otherwise it is rejected.
     ///   * **POST** — runtime delivery. The `X-Hub-Signature-256` header
     ///     is verified against the app secret (in [`Self::ingest_event`]).
-    async fn ingest_webhook(
-        &self,
-        req: &WebhookRequest,
-    ) -> Result<WebhookResponse, ChannelError> {
+    async fn ingest_webhook(&self, req: &WebhookRequest) -> Result<WebhookResponse, ChannelError> {
         if req.method == "GET" {
             let configured = self.config.verify_token.as_deref();
             let mode = req.query_get("hub.mode");
@@ -295,9 +292,9 @@ impl Channel for WhatsappChannel {
                 )),
             }
         } else {
-            let sig = req.header("x-hub-signature-256").ok_or_else(|| {
-                ChannelError::Auth("missing whatsapp signature header".into())
-            })?;
+            let sig = req
+                .header("x-hub-signature-256")
+                .ok_or_else(|| ChannelError::Auth("missing whatsapp signature header".into()))?;
             match self.ingest_event(&req.body, sig).await {
                 Ok(()) => Ok(WebhookResponse::ok()),
                 Err(e) => Err(ChannelError::Rejected(e.to_string())),

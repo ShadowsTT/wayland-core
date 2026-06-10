@@ -351,9 +351,7 @@ pub(crate) fn map_message_create(
     });
 
     // Human-facing author label: global_name > username > id.
-    let author_str = sender_display
-        .clone()
-        .unwrap_or_else(|| sender_id.clone());
+    let author_str = sender_display.clone().unwrap_or_else(|| sender_id.clone());
 
     let is_self = bot_id.is_some_and(|bid| bid == sender_id);
 
@@ -443,7 +441,7 @@ pub(crate) fn map_message_create(
         is_bot: false, // already filtered above — only non-bot messages reach here
         is_self,
         chat_type,
-        chat_name: None,    // not in MESSAGE_CREATE; requires channel GET
+        chat_name: None, // not in MESSAGE_CREATE; requires channel GET
         space_id: msg.guild_id,
         thread_id,
         parent_chat_id: None, // thread's parent channel not in this payload
@@ -462,11 +460,7 @@ fn media_kind_from_content_type(ct: Option<&str>) -> MediaKind {
         Some(s) if s.starts_with("image/") => MediaKind::Image,
         Some(s) if s.starts_with("video/") => MediaKind::Video,
         Some(s) if s.starts_with("audio/") => MediaKind::Audio,
-        Some(s)
-            if s.starts_with("application/") || s.starts_with("text/") =>
-        {
-            MediaKind::Document
-        }
+        Some(s) if s.starts_with("application/") || s.starts_with("text/") => MediaKind::Document,
         _ => MediaKind::Other,
     }
 }
@@ -572,10 +566,7 @@ pub(crate) enum ReconnectReason {
 /// - We can only RESUME when we actually hold a `session_id`.
 /// - A fatal Invalid Session forces a fresh IDENTIFY regardless of state.
 /// - Everything else resumes when state is present, else IDENTIFYs.
-pub(crate) fn decide_handshake(
-    have_session: bool,
-    reason: &ReconnectReason,
-) -> Handshake {
+pub(crate) fn decide_handshake(have_session: bool, reason: &ReconnectReason) -> Handshake {
     match reason {
         ReconnectReason::InvalidSessionFatal => Handshake::Identify,
         ReconnectReason::Resumable | ReconnectReason::InvalidSessionResumable => {
