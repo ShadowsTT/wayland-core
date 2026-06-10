@@ -84,7 +84,7 @@ mod tests {
                 name: "wayland-cua".into(),
                 version: "0.1.0".into(),
                 description: "test".into(),
-                entry: "builtin:wayland_cua".into(),
+                entry: Some("builtin:wayland_cua".into()),
                 authors: vec![],
                 license: "MIT".into(),
                 deferred: false,
@@ -97,6 +97,8 @@ mod tests {
             capabilities: Default::default(),
             plugin_api_version: None,
             runtime: None,
+            hooks: vec![],
+            mcp_server: None,
         }
     }
 

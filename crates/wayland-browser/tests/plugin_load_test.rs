@@ -38,5 +38,5 @@ fn default_spec_has_auto_provider_and_fail_closed_policy() {
 fn plugin_manifest_round_trips_through_factory() {
     let plugin = WaylandBrowser;
     let m = plugin.manifest();
-    assert_eq!(m.plugin.entry, "builtin:wayland_browser");
+    assert_eq!(m.plugin.entry.as_deref(), Some("builtin:wayland_browser"));
 }

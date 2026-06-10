@@ -481,6 +481,127 @@ binary_path = "bin/plugin"
     );
 }
 
+// ---------------------------------------------------------------------------
+// Path B step 1 — declarative on-disk plugin kind.
+//
+// A declarative plugin ships a `plugin.toml` with `runtime.kind =
+// "declarative"`, `[[hooks]]`, and an optional `[mcp_server]` — NO executable.
+// Discovery must route it to `RuntimeDispatch::Declarative`, succeed (no binary
+// to sign/spawn), and carry the parsed hooks + mcp_server spec out on the
+// handle.
+// ---------------------------------------------------------------------------
+
+/// T10 — a declarative manifest dispatches to `Declarative`, loads Ok, and the
+/// handle carries the declared hooks + mcp_server spec.
+#[tokio::test]
+async fn on_disk_declarative_plugin_discovered_and_dispatched() {
+    use wcore_agent::plugins::LoadedRuntimeHandle;
+    use wcore_plugin_api::registry::hooks::HookPhase;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _guard = EnvGuard::set(tmp.path());
+
+    let manifest_toml = r#"
+[plugin]
+name = "declarative-plug"
+version = "0.0.0"
+description = "fixture"
+license = "Apache-2.0"
+
+[permissions]
+register_hooks = true
+register_mcp_server = true
+
+[runtime]
+kind = "declarative"
+
+[[hooks]]
+phase = "session_start"
+tool = "memory_prelude"
+
+[mcp_server]
+name = "declarative-plug-server"
+
+[mcp_server.transport]
+kind = "sse"
+url = "https://example.invalid/sse"
+"#;
+    let _ = make_plugin_dir(tmp.path(), "declarative-plug", manifest_toml, None, None);
+
+    let config = config();
+    let mut loader = PluginLoader::discover(&config);
+    let runner = PluginRunner::new();
+    let gate = Arc::new(PluginAccessGate);
+
+    loader.discover_on_disk(&runner, None, gate).await;
+
+    let recs = loader.on_disk_dispatches();
+    assert_eq!(recs.len(), 1, "expected one dispatch, got {recs:?}");
+    let r = &recs[0];
+    assert_eq!(r.plugin_name, "declarative-plug");
+    assert_eq!(r.dispatch, RuntimeDispatch::Declarative);
+    assert!(
+        r.load_result.is_ok(),
+        "declarative load must succeed (no binary): {:?}",
+        r.load_result
+    );
+    match &r.handle {
+        LoadedRuntimeHandle::Declarative { hooks, mcp_server } => {
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].plugin, "declarative-plug");
+            assert_eq!(hooks[0].phase, HookPhase::SessionStart);
+            assert_eq!(hooks[0].name, "memory_prelude");
+            let spec = mcp_server.as_ref().expect("mcp_server present on handle");
+            assert_eq!(spec.name, "declarative-plug-server");
+        }
+        other => panic!("expected Declarative handle, got {other:?}"),
+    }
+    assert!(!runner.is_disabled("declarative-plug"));
+}
+
+/// T11 — a declarative plugin declaring `[[hooks]]` without `register_hooks`
+/// fails to load (manifest validation rejects it before dispatch).
+#[tokio::test]
+async fn on_disk_declarative_hooks_without_permission_rejected() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _guard = EnvGuard::set(tmp.path());
+
+    let manifest_toml = r#"
+[plugin]
+name = "declarative-nogrant"
+version = "0.0.0"
+description = "fixture"
+license = "Apache-2.0"
+
+[runtime]
+kind = "declarative"
+
+[[hooks]]
+phase = "session_start"
+tool = "memory_prelude"
+"#;
+    let _ = make_plugin_dir(tmp.path(), "declarative-nogrant", manifest_toml, None, None);
+
+    let config = config();
+    let mut loader = PluginLoader::discover(&config);
+    let runner = PluginRunner::new();
+    let gate = Arc::new(PluginAccessGate);
+
+    loader.discover_on_disk(&runner, None, gate).await;
+
+    let recs = loader.on_disk_dispatches();
+    assert_eq!(recs.len(), 1);
+    let r = &recs[0];
+    let err = r
+        .load_result
+        .as_ref()
+        .expect_err("hooks-without-register_hooks must be rejected");
+    assert!(
+        err.contains("parse manifest") || err.contains("register_hooks"),
+        "expected manifest-validation rejection, got: {err}"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn symlink_entry_in_plugins_root_skipped() {
@@ -525,4 +646,112 @@ binary_path = "does-not-exist"
         recs.is_empty(),
         "symlink in plugins root must be skipped, got dispatches: {recs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// C3 — multi-root discovery: the C3 profile home (`profile_home()/plugins`)
+// is scanned in ADDITION to `<data_dir>/wayland/plugins` when the
+// `$WAYLAND_PLUGINS_DIR` override is NOT set. This exercises the multi-root
+// branch of `resolved_plugins_roots()` — a declarative plugin installed by
+// IJFW's installer under `~/.wayland/plugins` must be discovered.
+// ---------------------------------------------------------------------------
+
+/// Pin `$WAYLAND_HOME` (so `profile_home()` resolves to a tempdir) while
+/// ensuring `$WAYLAND_PLUGINS_DIR` is UNSET, so discovery takes the multi-root
+/// path instead of the single-dir override. Holds the global env mutex and
+/// restores both vars on drop.
+struct ProfileHomeEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved_plugins_dir: Option<std::ffi::OsString>,
+}
+impl ProfileHomeEnvGuard {
+    fn set(home: &Path) -> Self {
+        let lock = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
+        let saved_plugins_dir = std::env::var_os("WAYLAND_PLUGINS_DIR");
+        unsafe {
+            // Force the multi-root branch: no single-dir override.
+            std::env::remove_var("WAYLAND_PLUGINS_DIR");
+            std::env::set_var("WAYLAND_HOME", home);
+            // Disable signing so the focus stays on discovery routing.
+            std::env::set_var("WAYLAND_PLUGIN_TRUST_UNSIGNED", "1");
+        }
+        Self {
+            _lock: lock,
+            saved_plugins_dir,
+        }
+    }
+}
+impl Drop for ProfileHomeEnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("WAYLAND_HOME");
+            std::env::remove_var("WAYLAND_PLUGIN_TRUST_UNSIGNED");
+            match self.saved_plugins_dir.take() {
+                Some(v) => std::env::set_var("WAYLAND_PLUGINS_DIR", v),
+                None => std::env::remove_var("WAYLAND_PLUGINS_DIR"),
+            }
+        }
+    }
+}
+
+/// C3 — a declarative plugin under `profile_home()/plugins` (the C3 profile
+/// home, where IJFW's installer drops it) is discovered via the multi-root
+/// path, WITHOUT setting `$WAYLAND_PLUGINS_DIR`.
+#[tokio::test]
+async fn on_disk_declarative_plugin_under_profile_home_discovered() {
+    use wcore_agent::plugins::LoadedRuntimeHandle;
+
+    // profile_home() == $WAYLAND_HOME (directly), so the plugins root is
+    // `<home>/plugins`.
+    let home = tempfile::TempDir::new().unwrap();
+    let _guard = ProfileHomeEnvGuard::set(home.path());
+    let plugins_root = home.path().join("plugins");
+    std::fs::create_dir_all(&plugins_root).unwrap();
+
+    let manifest_toml = r#"
+[plugin]
+name = "ijfw-installed"
+version = "0.0.0"
+description = "fixture"
+license = "Apache-2.0"
+
+[permissions]
+register_hooks = true
+
+[runtime]
+kind = "declarative"
+
+[[hooks]]
+phase = "session_start"
+tool = "memory_prelude"
+"#;
+    let _ = make_plugin_dir(&plugins_root, "ijfw-installed", manifest_toml, None, None);
+
+    let config = config();
+    let mut loader = PluginLoader::discover(&config);
+    let runner = PluginRunner::new();
+    let gate = Arc::new(PluginAccessGate);
+
+    loader.discover_on_disk(&runner, None, gate).await;
+
+    let recs = loader.on_disk_dispatches();
+    let found = recs
+        .iter()
+        .find(|r| r.plugin_name == "ijfw-installed")
+        .unwrap_or_else(|| {
+            panic!("plugin under profile_home()/plugins must be discovered, got: {recs:?}")
+        });
+    assert_eq!(found.dispatch, RuntimeDispatch::Declarative);
+    assert!(
+        found.load_result.is_ok(),
+        "declarative load must succeed: {:?}",
+        found.load_result
+    );
+    match &found.handle {
+        LoadedRuntimeHandle::Declarative { hooks, .. } => {
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0].plugin, "ijfw-installed");
+        }
+        other => panic!("expected Declarative handle, got {other:?}"),
+    }
 }

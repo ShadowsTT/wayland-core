@@ -57,7 +57,7 @@ pub use access_gate::PluginAccessGate;
 pub use context::PluginContext;
 pub use error::{PluginError, PluginResult};
 pub use manifest::{
-    PluginCapabilities, PluginIdentity, PluginInfo, PluginManifest, PluginPermissions,
+    ManifestHook, PluginCapabilities, PluginIdentity, PluginInfo, PluginManifest, PluginPermissions,
 };
 pub use plugin::{Plugin, PluginFactory};
 

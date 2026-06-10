@@ -8,6 +8,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PluginError, PluginResult};
+use crate::mcp_server_spec::McpServerSpec;
+use crate::registry::hooks::HookPhase;
 
 /// Wave SC SECURITY MAJOR fix — verified identity for a loaded plugin.
 ///
@@ -191,10 +193,33 @@ pub struct PluginManifest {
     pub plugin_api_version: Option<String>,
     /// v0.6.5 Task 1.1 — runtime-kind selector for the plugin SDK. Default
     /// `static` (compile-time-linked Rust plugins; the only kind supported
-    /// before v0.6.5). `wasm` / `subprocess` / `mcp-bridge` reserved for
-    /// later Wave 2/3 work.
+    /// before v0.6.5). `wasm` / `subprocess` / `mcp-bridge` / `declarative`.
     #[serde(default)]
     pub runtime: Option<PluginRuntime>,
+    /// Path B step 1 — declarative lifecycle hooks. Each entry binds a
+    /// `HookPhase` to a tool NAME that the C1 hook→context dispatcher matches
+    /// against an MCP server's advertised tool. Empty for non-declarative
+    /// plugins. Requires `permissions.register_hooks` when non-empty.
+    #[serde(default)]
+    pub hooks: Vec<ManifestHook>,
+    /// Path B step 1 — a declarative plugin's contributed MCP server spec.
+    /// Carries the same operator-trust as a config `[mcp.servers.*]` entry.
+    /// Requires `permissions.register_mcp_server` when present.
+    #[serde(default)]
+    pub mcp_server: Option<McpServerSpec>,
+}
+
+/// Path B step 1 — one declarative `[[hooks]]` entry. Binds a lifecycle
+/// `phase` to a `tool` NAME. The tool name is matched against an MCP server's
+/// advertised tool list by the C1 dispatcher (`resolve_server_for_plugin`).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestHook {
+    /// Lifecycle phase. `HookPhase` is `serde(rename_all = "snake_case")`,
+    /// so `phase = "session_start"` parses to `HookPhase::SessionStart`.
+    pub phase: HookPhase,
+    /// Tool name to dispatch in this phase.
+    pub tool: String,
 }
 
 /// v0.6.5 Task 1.1 — `[runtime]` manifest block. All fields optional;
@@ -252,7 +277,11 @@ pub struct PluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
-    pub entry: String,
+    /// Entry symbol / artifact reference. Optional: declarative on-disk
+    /// plugins have no executable, so they omit it. Compiled-in plugins
+    /// (and existing on-disk subprocess/wasm manifests) still set it.
+    #[serde(default)]
+    pub entry: Option<String>,
     #[serde(default)]
     pub authors: Vec<String>,
     pub license: String,
@@ -389,12 +418,32 @@ impl PluginManifest {
         if let Some(rt) = &self.runtime
             && !matches!(
                 rt.kind.as_str(),
-                "static" | "wasm" | "subprocess" | "mcp-bridge"
+                "static" | "wasm" | "subprocess" | "mcp-bridge" | "declarative"
             )
         {
             return Err(PluginError::UnknownRuntimeKind {
                 plugin: self.plugin.name.clone(),
                 kind: rt.kind.clone(),
+            });
+        }
+
+        // Path B step 1 — declarative-plugin permission gates. Declared hooks
+        // require `register_hooks`; a declared MCP server requires
+        // `register_mcp_server`. Hooks-without-mcp_server is allowed.
+        if !self.hooks.is_empty() && !self.permissions.register_hooks {
+            return Err(PluginError::ManifestSchema {
+                reason: format!(
+                    "{}: [[hooks]] declared but permissions.register_hooks is not granted",
+                    self.plugin.name
+                ),
+            });
+        }
+        if self.mcp_server.is_some() && !self.permissions.register_mcp_server {
+            return Err(PluginError::ManifestSchema {
+                reason: format!(
+                    "{}: [mcp_server] declared but permissions.register_mcp_server is not granted",
+                    self.plugin.name
+                ),
             });
         }
 

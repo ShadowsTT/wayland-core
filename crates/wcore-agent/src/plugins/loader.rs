@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use ed25519_dalek::VerifyingKey;
 use wcore_config::plugins_config::PluginsConfig;
+use wcore_plugin_api::McpServerSpec;
 use wcore_plugin_api::manifest::PluginIdentity;
 use wcore_plugin_api::registry::tools::NamespaceLedger;
 use wcore_plugin_api::{
@@ -27,6 +28,8 @@ use wcore_plugin_api::{
 };
 use wcore_plugin_subprocess::{LoadedMcpBridgePlugin, LoadedSubprocessPlugin};
 use wcore_plugin_wasm::LoadedWasmPlugin;
+
+use super::runner::PluginHook;
 
 use crate::plugins::sig_verifier::{
     ENV_TRUST_UNSIGNED, KeySource, load_filesystem_keys, parse_verifying_key_b64, trusted_keys_dir,
@@ -117,6 +120,21 @@ pub enum LoadedRuntimeHandle {
     Wasm(Arc<LoadedWasmPlugin>),
     Subprocess(Arc<LoadedSubprocessPlugin>),
     McpBridge(LoadedMcpBridgePlugin),
+    /// Path B step 1 — declarative on-disk plugin. Plain data: the parsed
+    /// lifecycle hooks and optional MCP server spec, threaded into
+    /// `plugin_outcome.hooks` / `plugin_outcome.mcp_servers` by bootstrap so
+    /// the existing C1 dispatcher binds + fires them. No Arc — there is no
+    /// running runtime to keep alive.
+    Declarative {
+        hooks: Vec<PluginHook>,
+        mcp_server: Option<McpServerSpec>,
+    },
+}
+
+impl std::fmt::Debug for LoadedRuntimeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.kind_str())
+    }
 }
 
 impl LoadedRuntimeHandle {
@@ -126,6 +144,7 @@ impl LoadedRuntimeHandle {
             Self::Wasm(_) => "Wasm",
             Self::Subprocess(_) => "Subprocess",
             Self::McpBridge(_) => "McpBridge",
+            Self::Declarative { .. } => "Declarative",
         }
     }
 }
@@ -225,9 +244,15 @@ impl<'a> PluginLoader<'a> {
     /// v0.6.5 Task 2.7b — walk the on-disk plugins root and route each
     /// manifest through the runtime-dispatch table built in Task 2.7.
     ///
-    /// Root resolution:
-    /// 1. `$WAYLAND_PLUGINS_DIR` (if set, even when empty after expansion)
-    /// 2. [`PluginIdentity::default_plugin_root`] (i.e. `~/.wayland/plugins/`)
+    /// Root resolution (see [`resolved_plugins_roots`]):
+    /// 1. `$WAYLAND_PLUGINS_DIR` (if set + non-empty) → that dir ONLY (override).
+    /// 2. Otherwise → both `<data_dir>/wayland/plugins` AND
+    ///    `profile_home()/plugins` (the C3 profile home), scanned in order.
+    ///
+    /// Each root is its own security anchor: `allowed_roots` for the
+    /// path-prefix gate is built from THAT root's canonicalization, and the
+    /// per-entry symlink defense applies per root. A non-existent root is
+    /// skipped with a debug log.
     ///
     /// For each `<root>/<plugin-name>/plugin.toml`:
     /// 1. Parse the manifest via [`PluginManifest::from_toml_str`] (which
@@ -254,12 +279,9 @@ impl<'a> PluginLoader<'a> {
         wasm_runner: Option<&wcore_plugin_wasm::WasmPluginRunner>,
         gate: Arc<PluginAccessGate>,
     ) {
-        let Some(root) = resolved_plugins_root() else {
+        let roots = resolved_plugins_roots();
+        if roots.is_empty() {
             tracing::debug!("on-disk plugins discovery skipped: no plugins root resolved");
-            return;
-        };
-        if !root.exists() {
-            tracing::debug!(root = %root.display(), "on-disk plugins root does not exist — skipping");
             return;
         }
 
@@ -268,74 +290,95 @@ impl<'a> PluginLoader<'a> {
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false);
 
-        // `allowed_roots` for PluginIdentity construction. We canonicalise
-        // when possible so that `from_path_prefix`'s starts_with check
-        // accepts manifests below `root`.
-        let allowed_roots = vec![root.canonicalize().unwrap_or_else(|_| root.clone())];
+        // Track plugin names seen across roots so a duplicate (same plugin in
+        // two roots) is observable. Dedup/last-wins downstream is unchanged.
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    root = %root.display(),
-                    error = %e,
-                    "on-disk plugins discovery: read_dir failed"
-                );
-                return;
+        for root in roots {
+            if !root.exists() {
+                tracing::debug!(root = %root.display(), "on-disk plugins root does not exist — skipping");
+                continue;
             }
-        };
 
-        for entry in entries.flatten() {
-            let plugin_dir = entry.path();
+            // `allowed_roots` is anchored to THIS root only. Each root is its
+            // own security boundary: we never widen the path-prefix check
+            // across roots. We canonicalise when possible so that
+            // `from_path_prefix`'s starts_with check accepts manifests below
+            // `root`.
+            let allowed_roots = vec![root.canonicalize().unwrap_or_else(|_| root.clone())];
 
-            // v0.6.5 Task 6B.4 — symlink defense: skip any entry that is a
-            // symlink. A malicious symlink in the plugins root could point
-            // at an attacker-controlled directory outside `allowed_roots`
-            // and bypass the path-prefix canonicalization check below.
-            // Fail-closed on file_type errors (treat as suspect → skip).
-            match entry.file_type() {
-                Ok(ft) if ft.is_symlink() => {
-                    tracing::warn!(
-                        path = %plugin_dir.display(),
-                        "skipping symlink in plugins dir for security"
-                    );
-                    continue;
-                }
+            let entries = match std::fs::read_dir(&root) {
+                Ok(e) => e,
                 Err(e) => {
                     tracing::warn!(
-                        path = %plugin_dir.display(),
+                        root = %root.display(),
                         error = %e,
-                        "skipping plugins-dir entry: file_type() failed"
+                        "on-disk plugins discovery: read_dir failed"
                     );
                     continue;
                 }
-                _ => {}
-            }
+            };
 
-            if !plugin_dir.is_dir() {
-                continue;
-            }
-            let manifest_path = plugin_dir.join("plugin.toml");
-            if !manifest_path.is_file() {
-                continue;
-            }
+            for entry in entries.flatten() {
+                let plugin_dir = entry.path();
 
-            let record = self
-                .dispatch_one_on_disk(
-                    &manifest_path,
-                    &allowed_roots,
-                    trust_unsigned,
-                    &union_keys,
-                    runner,
-                    wasm_runner,
-                    gate.clone(),
-                )
-                .await;
+                // v0.6.5 Task 6B.4 — symlink defense: skip any entry that is a
+                // symlink. A malicious symlink in the plugins root could point
+                // at an attacker-controlled directory outside `allowed_roots`
+                // and bypass the path-prefix canonicalization check below.
+                // Fail-closed on file_type errors (treat as suspect → skip).
+                match entry.file_type() {
+                    Ok(ft) if ft.is_symlink() => {
+                        tracing::warn!(
+                            path = %plugin_dir.display(),
+                            "skipping symlink in plugins dir for security"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %plugin_dir.display(),
+                            error = %e,
+                            "skipping plugins-dir entry: file_type() failed"
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
 
-            if record.load_result.is_err() {
-                runner.record_failure(&record.plugin_name);
+                if !plugin_dir.is_dir() {
+                    continue;
+                }
+                let manifest_path = plugin_dir.join("plugin.toml");
+                if !manifest_path.is_file() {
+                    continue;
+                }
+
+                let record = self
+                    .dispatch_one_on_disk(
+                        &manifest_path,
+                        &allowed_roots,
+                        trust_unsigned,
+                        &union_keys,
+                        runner,
+                        wasm_runner,
+                        gate.clone(),
+                    )
+                    .await;
+
+                if !seen_names.insert(record.plugin_name.clone()) {
+                    tracing::debug!(
+                        plugin = %record.plugin_name,
+                        root = %root.display(),
+                        "duplicate plugin name discovered across plugins roots — last wins"
+                    );
+                }
+
+                if record.load_result.is_err() {
+                    runner.record_failure(&record.plugin_name);
+                }
+                self.on_disk_dispatches.push(record);
             }
-            self.on_disk_dispatches.push(record);
         }
     }
 
@@ -479,7 +522,10 @@ impl<'a> PluginLoader<'a> {
                 .as_ref()
                 .and_then(|r| r.subprocess.as_ref())
                 .and_then(|s| s.binary_path.clone()),
-            RuntimeDispatch::Static => None,
+            // Path B step 1 — declarative plugins have no entry binary, so
+            // there is nothing to resolve or signature-verify. The
+            // `entry_path` guard below short-circuits on `None`.
+            RuntimeDispatch::Static | RuntimeDispatch::Declarative => None,
         };
 
         let entry_path: Option<PathBuf> = match declared_rel.as_deref() {
@@ -615,6 +661,30 @@ impl<'a> PluginLoader<'a> {
                 (
                     Err("on-disk manifest classified as Static".to_string()),
                     LoadedRuntimeHandle::None,
+                )
+            }
+            RuntimeDispatch::Declarative => {
+                // Path B step 1 — no binary to spawn or verify. Translate the
+                // manifest's declared `[[hooks]]` into `PluginHook`s (tagged
+                // with this plugin's name) and carry the optional `[mcp_server]`
+                // spec out on the handle. Path-prefix trust is already enforced
+                // (identity was built via `from_subprocess_path` above);
+                // binary signature verification does not apply.
+                let hooks: Vec<PluginHook> = manifest
+                    .hooks
+                    .iter()
+                    .map(|h| PluginHook {
+                        plugin: plugin_name.clone(),
+                        phase: h.phase,
+                        name: h.tool.clone(),
+                    })
+                    .collect();
+                (
+                    Ok(()),
+                    LoadedRuntimeHandle::Declarative {
+                        hooks,
+                        mcp_server: manifest.mcp_server.clone(),
+                    },
                 )
             }
         };
@@ -811,6 +881,10 @@ pub enum RuntimeDispatch {
     Subprocess,
     /// MCP-server-as-plugin bridge — load via `McpBridgePluginRunner::load`.
     McpBridge,
+    /// Path B step 1 — declarative plugin (`runtime.kind = "declarative"`):
+    /// no executable. Contributes `[[hooks]]` + an optional `[mcp_server]`
+    /// straight into the host's plugin outcome.
+    Declarative,
 }
 
 /// v0.6.5 Task 2.7 — classify a manifest into its target runtime.
@@ -828,6 +902,13 @@ pub fn classify_runtime(
 ) -> RuntimeDispatch {
     use wcore_plugin_api::manifest::PluginIdentity;
 
+    // Path B step 1 — declarative kind wins over identity: a declarative
+    // plugin has no binary, so it never routes to a binary-backed runner.
+    if let Some(rt) = manifest.runtime.as_ref()
+        && rt.kind.eq_ignore_ascii_case("declarative")
+    {
+        return RuntimeDispatch::Declarative;
+    }
     if let Some(rt) = manifest.runtime.as_ref()
         && rt.kind.eq_ignore_ascii_case("mcp-bridge")
     {
@@ -840,22 +921,44 @@ pub fn classify_runtime(
     }
 }
 
-/// v0.6.5 Task 2.7b — resolve the on-disk plugins root.
+/// v0.6.5 Task 2.7b — resolve the on-disk plugins root(s).
 ///
-/// Priority order:
-/// 1. `$WAYLAND_PLUGINS_DIR` (when set + non-empty)
-/// 2. [`PluginIdentity::default_plugin_root`]
+/// Resolution:
+/// 1. If `$WAYLAND_PLUGINS_DIR` is set + non-empty → return ONLY that dir.
+///    This is an explicit operator override: it REPLACES the default roots
+///    (preserving the single-dir test isolation the on-disk discovery tests
+///    rely on, and letting an operator pin discovery to one directory).
+/// 2. Otherwise → return both default roots, in order, de-duplicated:
+///    first [`PluginIdentity::default_plugin_root`]
+///    (`<data_dir>/wayland/plugins`), then `profile_home()/plugins` (the C3
+///    profile home, i.e. `~/.wayland/plugins`, where a declarative plugin
+///    installed by IJFW's installer lands).
 ///
-/// Returns `None` when neither yields a value (e.g. `dirs::data_dir()`
-/// returns `None` AND the env var is unset — vanishingly rare; covered
-/// by the no-root-skipped branch in [`PluginLoader::discover_on_disk`]).
-pub(crate) fn resolved_plugins_root() -> Option<PathBuf> {
+/// Each returned root is its OWN security anchor in [`PluginLoader::discover_on_disk`]:
+/// the per-root path-prefix gate + symlink defense apply identically to every
+/// root. The profile-home root is the same trust class (user-controlled home
+/// location) as the data-dir root.
+///
+/// May return an empty `Vec` only in the vanishingly rare case where the env
+/// var is unset AND `default_plugin_root()` somehow coincides after dedup with
+/// nothing else — covered by the no-root branches in `discover_on_disk`.
+pub(crate) fn resolved_plugins_roots() -> Vec<PathBuf> {
     if let Ok(v) = std::env::var(ENV_PLUGINS_DIR)
         && !v.is_empty()
     {
-        return Some(PathBuf::from(v));
+        // Operator override: replace the defaults with exactly this dir.
+        return vec![PathBuf::from(v)];
     }
-    Some(PluginIdentity::default_plugin_root())
+
+    let mut roots = Vec::with_capacity(2);
+    let mut push_unique = |p: PathBuf| {
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+    push_unique(PluginIdentity::default_plugin_root());
+    push_unique(wcore_config::config::profile_home().join("plugins"));
+    roots
 }
 
 #[cfg(test)]
@@ -1017,6 +1120,79 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // C3 — multi-root plugins discovery resolution.
+    //
+    // `resolved_plugins_roots()` must:
+    // - return ONLY the override dir when `$WAYLAND_PLUGINS_DIR` is set
+    //   (preserving single-dir test isolation), and
+    // - return BOTH `default_plugin_root()` and `profile_home()/plugins`
+    //   when the override is unset (so an IJFW-installed declarative plugin
+    //   under `~/.wayland/plugins` is reachable).
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_plugins_roots_override_is_single_dir() {
+        // SAFETY: env mutation is serialized by `#[serial_test::serial]` and
+        // restored at the end of this test.
+        unsafe {
+            std::env::set_var(ENV_PLUGINS_DIR, "/tmp/some-pinned-plugins");
+        }
+        let roots = resolved_plugins_roots();
+        unsafe {
+            std::env::remove_var(ENV_PLUGINS_DIR);
+        }
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/tmp/some-pinned-plugins")],
+            "override must REPLACE the defaults with exactly one dir"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolved_plugins_roots_default_includes_data_dir_and_profile_home() {
+        // SAFETY: env mutation is serialized by `#[serial_test::serial]`.
+        // Both vars are saved + restored around the body.
+        let saved_plugins = std::env::var_os(ENV_PLUGINS_DIR);
+        let saved_home = std::env::var_os("WAYLAND_HOME");
+        let home = TempDir::new().unwrap();
+        unsafe {
+            std::env::remove_var(ENV_PLUGINS_DIR);
+            // Pin profile_home() to a deterministic location.
+            std::env::set_var("WAYLAND_HOME", home.path());
+        }
+
+        let roots = resolved_plugins_roots();
+
+        unsafe {
+            match saved_plugins {
+                Some(v) => std::env::set_var(ENV_PLUGINS_DIR, v),
+                None => std::env::remove_var(ENV_PLUGINS_DIR),
+            }
+            match saved_home {
+                Some(v) => std::env::set_var("WAYLAND_HOME", v),
+                None => std::env::remove_var("WAYLAND_HOME"),
+            }
+        }
+
+        let expected_data = PluginIdentity::default_plugin_root();
+        let expected_profile = home.path().join("plugins");
+        assert!(
+            roots.contains(&expected_data),
+            "default roots must include data-dir root {expected_data:?}; got {roots:?}"
+        );
+        assert!(
+            roots.contains(&expected_profile),
+            "default roots must include profile-home root {expected_profile:?}; got {roots:?}"
+        );
+        // data_dir first, then profile_home (order preserved).
+        let di = roots.iter().position(|r| r == &expected_data).unwrap();
+        let pi = roots.iter().position(|r| r == &expected_profile).unwrap();
+        assert!(di < pi, "data-dir root must precede profile-home root");
+    }
+
+    // -----------------------------------------------------------------
     // v0.6.5 Task 2.7 — RuntimeDispatch classifier tests.
     //
     // Builds fixtures that don't touch disk and verifies each of the four
@@ -1083,5 +1259,14 @@ license = "Apache-2.0"
         let id = PluginIdentity::from_static("fixture");
         let m = fixture_manifest(None);
         assert_eq!(classify_runtime(&id, &m), RuntimeDispatch::Static);
+    }
+
+    // Path B step 1 — T8: a manifest with runtime.kind = "declarative" routes
+    // to RuntimeDispatch::Declarative regardless of the (path-prefix) identity.
+    #[test]
+    fn classify_runtime_routes_declarative_kind_to_declarative() {
+        let id = PluginIdentity::from_static("fixture");
+        let m = fixture_manifest(Some("declarative"));
+        assert_eq!(classify_runtime(&id, &m), RuntimeDispatch::Declarative);
     }
 }

@@ -8,7 +8,7 @@ use wcore_plugin_api::{Plugin, PluginManifest};
 fn manifest_parses_and_declares_full_surface() {
     let m = PluginManifest::from_toml_str(MANIFEST_TOML).expect("manifest must parse");
     assert_eq!(m.plugin.name, "wayland-ijfw");
-    assert_eq!(m.plugin.entry, "builtin:wayland_ijfw");
+    assert_eq!(m.plugin.entry.as_deref(), Some("builtin:wayland_ijfw"));
 
     assert!(m.permissions.register_tools);
     assert_eq!(m.permissions.tool_namespace.as_deref(), Some("ijfw"));

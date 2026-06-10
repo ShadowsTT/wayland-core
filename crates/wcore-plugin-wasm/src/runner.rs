@@ -1083,7 +1083,7 @@ tool_namespace = "legacy"
             name: "x".into(),
             version: "0.0".into(),
             description: "y".into(),
-            entry: "e".into(),
+            entry: Some("e".into()),
             authors: vec![],
             license: "MIT".into(),
             deferred: false,

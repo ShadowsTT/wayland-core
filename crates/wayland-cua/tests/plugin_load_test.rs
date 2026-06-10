@@ -34,7 +34,7 @@ fn default_spec_has_cua_namespace_and_first_time_approval() {
 fn plugin_manifest_round_trips_through_factory() {
     let plugin = WaylandCua;
     let m = plugin.manifest();
-    assert_eq!(m.plugin.entry, "builtin:wayland_cua");
+    assert_eq!(m.plugin.entry.as_deref(), Some("builtin:wayland_cua"));
 }
 
 #[test]

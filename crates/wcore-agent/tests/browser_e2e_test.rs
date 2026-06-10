@@ -39,7 +39,7 @@ fn fixture_manifest(allowed: &[&str]) -> PluginManifest {
             name: "wayland-browser".into(),
             version: "0.1.0".into(),
             description: "test mirror".into(),
-            entry: "builtin:wayland_browser".into(),
+            entry: Some("builtin:wayland_browser".into()),
             authors: vec![],
             license: "MIT".into(),
             deferred: false,
@@ -52,6 +52,8 @@ fn fixture_manifest(allowed: &[&str]) -> PluginManifest {
         capabilities: Default::default(),
         plugin_api_version: None,
         runtime: None,
+        hooks: vec![],
+        mcp_server: None,
     }
     .also(|_| {
         let _ = allowed;
