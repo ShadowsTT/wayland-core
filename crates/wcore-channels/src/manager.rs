@@ -221,7 +221,39 @@ impl ChannelManager {
             .get(name)
             .ok_or_else(|| ChannelError::Config(format!("unknown channel: {name}")))?;
         let mut guard = slot.lock().await;
-        guard.send_message(msg).await
+
+        // Split over-long bodies to the platform cap so a long reply is
+        // delivered in pieces rather than rejected+dropped (HIGH-6). When the
+        // connector declares no cap (or the body already fits) this is a
+        // single send, byte-identical to the pre-chunking path.
+        let chunks = match guard.max_message_len() {
+            Some(max) if max > 0 => crate::chunk::chunk_message(&msg.text, max),
+            _ => vec![msg.text.clone()],
+        };
+        if chunks.len() <= 1 {
+            return guard.send_message(msg).await;
+        }
+
+        // Multi-chunk: each piece keeps the conversation + reply target;
+        // attachments ride the LAST chunk (so the text precedes the media).
+        // Returns the final chunk's receipt.
+        let last = chunks.len() - 1;
+        let mut receipt: Option<MessageReceipt> = None;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let part = OutgoingMessage {
+                conversation_id: msg.conversation_id.clone(),
+                text: chunk,
+                reply_to: msg.reply_to.clone(),
+                attachments: if i == last {
+                    msg.attachments.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            receipt = Some(guard.send_message(part).await?);
+        }
+        // INVARIANT: chunks.len() > 1 here, so the loop ran and set `receipt`.
+        receipt.ok_or_else(|| ChannelError::Other("chunked send produced no receipt".into()))
     }
 
     /// List names of registered channels, sorted alphabetically.
@@ -344,6 +376,132 @@ mod tests {
         fn config_schema(&self) -> &str {
             r#"{"name": "string", "platform": "flaky"}"#
         }
+    }
+
+    /// Test-only channel with a small `max_message_len` that records every
+    /// `send_message` into a shared log, so a test can assert how `send_to`
+    /// chunked an over-long body.
+    struct CappedChannel {
+        name: String,
+        cap: usize,
+        sent: std::sync::Arc<tokio::sync::Mutex<Vec<OutgoingMessage>>>,
+    }
+
+    impl CappedChannel {
+        fn new(
+            name: &str,
+            cap: usize,
+        ) -> (Self, std::sync::Arc<tokio::sync::Mutex<Vec<OutgoingMessage>>>) {
+            let sent = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    name: name.into(),
+                    cap,
+                    sent: std::sync::Arc::clone(&sent),
+                },
+                sent,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Channel for CappedChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn platform(&self) -> &str {
+            "capped"
+        }
+        async fn start(&mut self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn stop(&mut self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        async fn poll_events(&mut self) -> Result<Vec<ChannelEvent>, ChannelError> {
+            Ok(Vec::new())
+        }
+        async fn send_message(
+            &mut self,
+            msg: OutgoingMessage,
+        ) -> Result<MessageReceipt, ChannelError> {
+            let idx = {
+                let mut log = self.sent.lock().await;
+                log.push(msg.clone());
+                log.len() - 1
+            };
+            Ok(MessageReceipt {
+                id: format!("capped-out-{idx}"),
+                conversation_id: msg.conversation_id,
+                ts_secs: 0,
+            })
+        }
+        fn config_schema(&self) -> &str {
+            r#"{"name":"string","platform":"capped"}"#
+        }
+        fn max_message_len(&self) -> Option<usize> {
+            Some(self.cap)
+        }
+    }
+
+    #[tokio::test]
+    async fn send_to_chunks_overlong_body_to_the_cap() {
+        let (ch, sent) = CappedChannel::new("capped", 10);
+        let mut mgr = ChannelManager::new();
+        mgr.register(Box::new(ch)).await;
+
+        // 25 chars, no break points → hard-split into 10/10/5.
+        let body = "abcdefghijklmnopqrstuvwxy".to_string();
+        let receipt = mgr
+            .send_to(
+                "capped",
+                OutgoingMessage {
+                    conversation_id: "c1".into(),
+                    text: body.clone(),
+                    reply_to: Some("t1".into()),
+                    attachments: vec!["file://a".into()],
+                },
+            )
+            .await
+            .expect("send_to");
+
+        let log = sent.lock().await;
+        assert_eq!(log.len(), 3, "25 chars at cap 10 → 3 sends");
+        assert!(
+            log.iter().all(|m| m.text.chars().count() <= 10),
+            "every chunk within the cap"
+        );
+        assert_eq!(
+            log.iter().map(|m| m.text.clone()).collect::<String>(),
+            body,
+            "lossless reassembly across chunks"
+        );
+        // reply_to carried on every chunk; attachments only on the last.
+        assert!(log.iter().all(|m| m.reply_to.as_deref() == Some("t1")));
+        assert!(log[0].attachments.is_empty());
+        assert!(log[1].attachments.is_empty());
+        assert_eq!(log[2].attachments, vec!["file://a".to_string()]);
+        // Receipt is the final chunk's.
+        assert_eq!(receipt.id, "capped-out-2");
+    }
+
+    #[tokio::test]
+    async fn send_to_does_not_chunk_when_within_cap() {
+        let (ch, sent) = CappedChannel::new("capped", 100);
+        let mut mgr = ChannelManager::new();
+        mgr.register(Box::new(ch)).await;
+        mgr.send_to(
+            "capped",
+            OutgoingMessage {
+                conversation_id: "c1".into(),
+                text: "short".into(),
+                reply_to: None,
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("send_to");
+        assert_eq!(sent.lock().await.len(), 1, "a fitting body is one send");
     }
 
     #[tokio::test]

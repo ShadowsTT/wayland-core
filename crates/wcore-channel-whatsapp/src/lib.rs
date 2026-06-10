@@ -260,6 +260,11 @@ impl Channel for WhatsappChannel {
         include_str!("../schemas/whatsapp.json")
     }
 
+    /// WhatsApp caps a single text message body at 4096 characters.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(4096)
+    }
+
     /// Handle a Meta WhatsApp Cloud API webhook request.
     ///
     /// Meta drives two distinct flows over the same URL:
@@ -549,6 +554,12 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(ch.config_schema()).expect("schema parses");
         assert_eq!(parsed["title"].as_str(), Some("WhatsappChannelConfig"));
+    }
+
+    #[tokio::test]
+    async fn max_message_len_is_whatsapp_cap() {
+        let ch = WhatsappChannel::new("test", cfg_for("https://unused.example"), store_for_test());
+        assert_eq!(ch.max_message_len(), Some(4096));
     }
 
     #[tokio::test]

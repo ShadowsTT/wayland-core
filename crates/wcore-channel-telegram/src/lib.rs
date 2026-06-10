@@ -242,6 +242,11 @@ impl Channel for TelegramChannel {
     fn config_schema(&self) -> &str {
         include_str!("schemas/telegram.json")
     }
+
+    /// Telegram caps a single message at 4096 characters.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(4096)
+    }
 }
 
 // ===========================================================================
@@ -301,6 +306,13 @@ mod tests {
     }
 
     const TEST_TOKEN: &str = "111:AAAA-test-bot-token";
+
+    #[test]
+    fn max_message_len_is_telegram_cap() {
+        let creds = InMemoryCreds::with_token("telegram.test.bot_token", TEST_TOKEN);
+        let ch = TelegramChannel::new("test", cfg(), creds);
+        assert_eq!(ch.max_message_len(), Some(4096));
+    }
 
     // -----------------------------------------------------------------
     // 1. send_message hits sendMessage with token + JSON body.

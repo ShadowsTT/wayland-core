@@ -14,6 +14,7 @@
 //! came from.
 
 pub mod auto_register;
+pub mod chunk;
 pub mod config;
 pub mod dispatch;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod mock;
 pub mod outgoing;
 pub mod webhook;
 
+pub use chunk::chunk_message;
 pub use config::{ChannelConfig, ChannelConfigLoader};
 pub use dispatch::{
     build_session_key, classify, decide_access, evaluate, AccessDecision, ChannelToolPosture,
@@ -81,6 +83,19 @@ pub trait Channel: Send + Sync {
     /// config TOML. UI uses this to render a setup form; tests use
     /// it to validate config files.
     fn config_schema(&self) -> &str;
+
+    /// Maximum length (in Unicode scalar values) of a single outbound
+    /// message this platform accepts, or `None` when effectively
+    /// unbounded / unknown. [`ChannelManager::send_to`] splits longer
+    /// bodies into in-order chunks via
+    /// [`chunk_message`](crate::chunk::chunk_message) before sending, so
+    /// an over-long agent reply is delivered in pieces instead of being
+    /// rejected and dropped by the platform. Each connector declares its
+    /// own cap here — the shared layer never hardcodes a per-platform
+    /// limit.
+    fn max_message_len(&self) -> Option<usize> {
+        None
+    }
 
     /// Handle an inbound webhook HTTP request routed to this channel by
     /// the inbound webhook host.

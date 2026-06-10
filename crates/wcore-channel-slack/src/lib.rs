@@ -266,6 +266,11 @@ impl Channel for SlackChannel {
         include_str!("../schemas/slack.json")
     }
 
+    /// Slack caps a single message around 40k characters; 39k is conservative.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(39_000)
+    }
+
     /// Verify a Slack Events API POST and enqueue any resulting event.
     ///
     /// Pulls the `X-Slack-Signature` + `X-Slack-Request-Timestamp` headers
@@ -569,6 +574,12 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(ch.config_schema()).expect("schema parses");
         assert_eq!(parsed["title"].as_str(), Some("SlackChannelConfig"));
+    }
+
+    #[tokio::test]
+    async fn max_message_len_is_slack_cap() {
+        let ch = SlackChannel::new("test", cfg_for("https://unused.example"), store_for_test());
+        assert_eq!(ch.max_message_len(), Some(39_000));
     }
 
     #[tokio::test]

@@ -282,6 +282,11 @@ impl Channel for MsTeamsChannel {
     fn config_schema(&self) -> &str {
         include_str!("schemas/msteams.json")
     }
+
+    /// Microsoft Teams caps a single message at roughly 28000 characters.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(28_000)
+    }
 }
 
 /// Parse `{serviceUrl}|{conversationId}` or return `(default_service_url, raw)`.
@@ -403,6 +408,12 @@ service_url = "https://smba.trafficmanager.net/emea/"
     fn platform_tag_is_msteams() {
         let ch = MsTeamsChannel::new("test", cfg(), MemCreds::empty());
         assert_eq!(ch.platform(), "msteams");
+    }
+
+    #[test]
+    fn max_message_len_is_msteams_cap() {
+        let ch = MsTeamsChannel::new("test", cfg(), MemCreds::empty());
+        assert_eq!(ch.max_message_len(), Some(28_000));
     }
 
     // 3. send_message before start surfaces NotStarted.

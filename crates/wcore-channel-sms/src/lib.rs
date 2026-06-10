@@ -262,6 +262,11 @@ impl Channel for SmsChannel {
         include_str!("schemas/sms.json")
     }
 
+    /// Twilio concatenated SMS caps a single message at 1600 characters.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(1600)
+    }
+
     /// Verify a Twilio webhook POST and enqueue the inbound SMS.
     ///
     /// Twilio signs the full request URL plus the sorted form body, so the
@@ -338,6 +343,12 @@ mod tests {
             ("sms.test.account_sid", TEST_SID),
             ("sms.test.auth_token", TEST_TOKEN),
         ])
+    }
+
+    #[test]
+    fn max_message_len_is_sms_cap() {
+        let ch = SmsChannel::new("test", cfg_for("https://unused.example"), store_for_test());
+        assert_eq!(ch.max_message_len(), Some(1600));
     }
 
     // -----------------------------------------------------------------

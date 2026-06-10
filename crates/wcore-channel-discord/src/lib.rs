@@ -250,6 +250,11 @@ impl Channel for DiscordChannel {
     fn config_schema(&self) -> &str {
         include_str!("schemas/discord.json")
     }
+
+    /// Discord caps a single message at 2000 characters.
+    fn max_message_len(&self) -> Option<usize> {
+        Some(2000)
+    }
 }
 
 // ===========================================================================
@@ -497,6 +502,13 @@ heartbeat_grace_ms = 8000
         assert_eq!(cfg.allowed_channel_ids, vec!["111", "222"]);
         assert_eq!(cfg.intents, 513);
         assert_eq!(cfg.heartbeat_grace_ms, 8_000);
+    }
+
+    #[test]
+    fn max_message_len_is_discord_cap() {
+        let creds = InMemoryCreds::with_token("discord.test.bot_token", TEST_TOKEN);
+        let ch = DiscordChannel::new("test", cfg(), creds);
+        assert_eq!(ch.max_message_len(), Some(2000));
     }
 
     // -----------------------------------------------------------------
