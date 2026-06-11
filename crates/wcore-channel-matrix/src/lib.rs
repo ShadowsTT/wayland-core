@@ -263,6 +263,22 @@ impl Channel for MatrixChannel {
         .await
         .map_err(|e| ChannelError::Transport(e.to_string()))
     }
+
+    /// Download unencrypted inbound media by its `mxc://` URI via the
+    /// authenticated media endpoint. `attachment.url` carries the `mxc://`
+    /// URI mapped by the `/sync` parser.
+    async fn fetch_media(
+        &self,
+        attachment: &wcore_channels::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let token = self
+            .access_token
+            .as_deref()
+            .ok_or(ChannelError::NotStarted)?;
+        rest::download_media(&self.http, &self.api_base, token, &attachment.url)
+            .await
+            .map_err(|e| ChannelError::Transport(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------

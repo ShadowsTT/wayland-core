@@ -353,6 +353,79 @@ pub async fn send_reaction(
     Ok(())
 }
 
+/// Step-1 media metadata response (Meta Graph API). We only need `url`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaMetaResponse {
+    pub url: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+}
+
+/// Download inbound WhatsApp media by id: resolve the id to a temporary URL
+/// (Bearer), then download that URL (Bearer). Single attempt per hop; the
+/// media enricher bounds the whole thing with its own timeout.
+pub async fn download_media(
+    http: &wcore_egress::EgressClient,
+    api_base: &str,
+    graph_version: &str,
+    access_token: &str,
+    media_id: &str,
+) -> Result<Vec<u8>, WhatsappError> {
+    // Step 1: id -> temporary URL.
+    let meta_url = format!(
+        "{}/{}/{}",
+        api_base.trim_end_matches('/'),
+        graph_version.trim_matches('/'),
+        media_id,
+    );
+    let resp = http
+        .get(&meta_url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| WhatsappError::Api(format!("media meta send error: {e}")))?;
+    let status = resp.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WhatsappError::Auth(format!(
+            "media meta HTTP {}: {}",
+            status.as_u16(),
+            summarise(&body)
+        )));
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(WhatsappError::Api(format!(
+            "media meta HTTP {}: {}",
+            status.as_u16(),
+            summarise(&body)
+        )));
+    }
+    let meta: MediaMetaResponse = resp
+        .json()
+        .await
+        .map_err(|e| WhatsappError::MalformedPayload(format!("decode media meta: {e}")))?;
+
+    // Step 2: download the temporary URL (still Bearer-authenticated).
+    let resp2 = http
+        .get(&meta.url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| WhatsappError::Api(format!("media download send error: {e}")))?;
+    if !resp2.status().is_success() {
+        return Err(WhatsappError::Api(format!(
+            "media download HTTP {}",
+            resp2.status().as_u16()
+        )));
+    }
+    let bytes = resp2
+        .bytes()
+        .await
+        .map_err(|e| WhatsappError::Api(format!("media body read: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 #[cfg(test)]
 mod reaction_tests {
     use super::*;
@@ -401,6 +474,53 @@ mod reaction_tests {
         let err = send_reaction(&http, &server.url(), "v20.0", "PHONE", "tok", &req)
             .await
             .expect_err("401 should error");
+        assert!(matches!(err, WhatsappError::Auth(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn download_media_two_step_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let dl_path = "/dl/abc";
+        let meta_body = format!(
+            r#"{{"url":"{}{}","mime_type":"image/jpeg"}}"#,
+            server.url(),
+            dl_path
+        );
+        let meta = server
+            .mock("GET", "/v20.0/MID")
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .with_body(meta_body)
+            .create_async()
+            .await;
+        let dl = server
+            .mock("GET", dl_path)
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .with_body(b"\xff\xd8\xff\xe0jpeg".as_slice())
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let bytes = download_media(&http, &server.url(), "v20.0", "tok", "MID")
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..3], b"\xff\xd8\xff");
+        meta.assert_async().await;
+        dl.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_media_unauthorized_maps_to_auth() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let err = download_media(&http, &server.url(), "v20.0", "tok", "MID")
+            .await
+            .unwrap_err();
         assert!(matches!(err, WhatsappError::Auth(_)), "got {err:?}");
     }
 }

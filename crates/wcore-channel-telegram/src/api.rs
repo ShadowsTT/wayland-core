@@ -584,6 +584,32 @@ pub(crate) async fn set_message_reaction(
     post_once(http, &url, body).await
 }
 
+/// Download an already-resolved media URL (the bot token is embedded in the
+/// Telegram file path, so no extra auth header is needed). Single attempt —
+/// the media enricher bounds the call with its own timeout.
+pub(crate) async fn download_bytes(
+    http: &wcore_egress::EgressClient,
+    url: &str,
+) -> Result<Vec<u8>, TelegramError> {
+    let resp = http
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| TelegramError::Http(format!("network: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(TelegramError::Http(format!(
+            "media download returned HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| TelegramError::Http(format!("media body read: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 fn exp_backoff_ms(attempt: u32) -> u64 {
     // attempt=1 -> 200ms, attempt=2 -> 400ms, attempt=3 -> 800ms, ...
     let shift = attempt.saturating_sub(1).min(10);
@@ -671,5 +697,41 @@ mod tests {
         assert_eq!(reaction.len(), 1);
         assert_eq!(reaction[0]["type"], "emoji");
         assert_eq!(reaction[0]["emoji"], "👀");
+    }
+
+    #[tokio::test]
+    async fn download_bytes_fetches_media() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/file/bot1:tok/photos/x.jpg")
+            .with_status(200)
+            .with_body(b"\xff\xd8\xff\xe0imagebytes".as_slice())
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let bytes = download_bytes(
+            &http,
+            &format!("{}/file/bot1:tok/photos/x.jpg", server.url()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&bytes[..3], b"\xff\xd8\xff");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_bytes_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        assert!(
+            download_bytes(&http, &format!("{}/x", server.url()))
+                .await
+                .is_err()
+        );
     }
 }

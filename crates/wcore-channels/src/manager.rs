@@ -290,6 +290,28 @@ impl ChannelManager {
         guard.react(conversation_id, message_id, emoji).await
     }
 
+    /// Fetch an inbound attachment's bytes through the originating channel
+    /// `name`, which holds its own credentials and platform media protocol.
+    /// Mirrors [`Self::react_on`]. Unknown channel → `Config` error;
+    /// connectors without media support → `Rejected` via the trait default.
+    ///
+    /// NOTE (concurrency): like `react_on`/`send_typing_to`, this holds the
+    /// channel's mutex across the download, briefly pausing that one channel's
+    /// poll/send while its own just-received media is fetched. The enricher
+    /// bounds the call with a timeout so a slow media host can't stall it.
+    pub async fn fetch_media_on(
+        &self,
+        name: &str,
+        attachment: &crate::event::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let slot = self
+            .channels
+            .get(name)
+            .ok_or_else(|| ChannelError::Config(format!("unknown channel: {name}")))?;
+        let guard = slot.lock().await;
+        guard.fetch_media(attachment).await
+    }
+
     /// List names of registered channels, sorted alphabetically.
     pub fn list_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.channels.keys().cloned().collect();

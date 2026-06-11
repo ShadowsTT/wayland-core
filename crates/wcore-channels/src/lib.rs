@@ -144,4 +144,28 @@ pub trait Channel: Send + Sync {
             "channel does not accept inbound webhooks".to_string(),
         ))
     }
+
+    /// Fetch the raw bytes of an inbound [`Attachment`](crate::event::Attachment)
+    /// using THIS connector's own credentials and platform media protocol.
+    ///
+    /// Media URLs differ per platform: Telegram/Discord expose a directly
+    /// fetchable URL; Slack needs a bearer on `url_private`; WhatsApp resolves
+    /// a media-id to a short-lived URL then downloads it; Matrix translates an
+    /// `mxc://` URI to the authenticated download endpoint. The agent-side
+    /// media enricher calls this through [`ChannelManager::fetch_media_on`] so
+    /// credentials never leave the connector boundary.
+    ///
+    /// Default: **unsupported** — a connector that doesn't override this (no
+    /// inbound media, or none wired yet) returns `Rejected`, and the enricher
+    /// falls back to the bare-URL summary. Takes `&self` (like `react` /
+    /// `ingest_webhook`): the read-only download uses the connector's
+    /// immutable client + token.
+    async fn fetch_media(
+        &self,
+        _attachment: &crate::event::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        Err(ChannelError::Rejected(
+            "media fetch unsupported".to_string(),
+        ))
+    }
 }

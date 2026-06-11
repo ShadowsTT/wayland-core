@@ -262,6 +262,32 @@ pub(crate) async fn add_reaction(
     status_to_result(resp.status(), "reaction")
 }
 
+/// Download a public Discord CDN media URL (no Authorization — the CDN is
+/// public; sending the bot token would be wrong). Single attempt; the media
+/// enricher bounds it with its own timeout.
+pub(crate) async fn download_bytes(
+    http: &wcore_egress::EgressClient,
+    url: &str,
+) -> Result<Vec<u8>, DiscordError> {
+    let resp = http
+        .get(url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| DiscordError::Http(format!("network: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(DiscordError::Http(format!(
+            "media download returned HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| DiscordError::Http(format!("media body read: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 /// Classify a bodyless Discord response: 2xx → Ok, 401/403 → Auth,
 /// anything else → Rejected. Used by the best-effort typing/reaction calls
 /// that don't parse a response body.
@@ -425,5 +451,38 @@ mod reaction_tests {
     /// the nonce is `[0-9a-f-]`). Kept tiny and local.
     fn regex_escape(s: &str) -> String {
         s.replace('-', r"\-")
+    }
+
+    #[tokio::test]
+    async fn download_bytes_fetches_cdn_media() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/attachments/1/2/x.png")
+            .with_status(200)
+            .with_body(b"\x89PNG\r\n\x1a\npngbytes".as_slice())
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let bytes = download_bytes(&http, &format!("{}/attachments/1/2/x.png", server.url()))
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_bytes_errors_on_404() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        assert!(
+            download_bytes(&http, &format!("{}/x", server.url()))
+                .await
+                .is_err()
+        );
     }
 }

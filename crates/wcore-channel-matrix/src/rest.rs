@@ -151,6 +151,50 @@ pub async fn send_reaction(
     }
 }
 
+/// Split an `mxc://server/mediaId` URI into `(server, mediaId)`.
+fn parse_mxc(mxc: &str) -> Result<(&str, &str), MatrixError> {
+    let rest = mxc
+        .strip_prefix("mxc://")
+        .ok_or_else(|| MatrixError::Parse(format!("not an mxc URI: {mxc}")))?;
+    rest.split_once('/')
+        .filter(|(s, m)| !s.is_empty() && !m.is_empty())
+        .ok_or_else(|| MatrixError::Parse(format!("malformed mxc URI: {mxc}")))
+}
+
+/// Download unencrypted Matrix media by its `mxc://server/id` URI via the
+/// authenticated media endpoint (Matrix v1.11+ / MSC3916):
+/// `GET /_matrix/client/v1/media/download/{server}/{mediaId}` with the access
+/// token. Replaces the deprecated unauthenticated `/_matrix/media/v3/download`.
+pub async fn download_media(
+    http: &wcore_egress::EgressClient,
+    api_base: &str,
+    access_token: &str,
+    mxc: &str,
+) -> Result<Vec<u8>, MatrixError> {
+    let (server, media_id) = parse_mxc(mxc)?;
+    let url = format!(
+        "{api_base}/_matrix/client/v1/media/download/{}/{}",
+        urlencoding::encode(server),
+        urlencoding::encode(media_id),
+    );
+    let resp = http
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| MatrixError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(MatrixError::Http { status, body });
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| MatrixError::Network(format!("media body read: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 // ---------------------------------------------------------------------------
 // Minimal urlencoding without adding a dep (percent-encode room IDs).
 // ---------------------------------------------------------------------------
@@ -267,6 +311,53 @@ mod ack_tests {
             .expect_err("403 should error");
         assert!(
             matches!(err, MatrixError::Http { status: 403, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_mxc_splits_server_and_id() {
+        assert_eq!(
+            parse_mxc("mxc://ex.org/abc123").unwrap(),
+            ("ex.org", "abc123")
+        );
+        assert!(parse_mxc("https://ex.org/x").is_err());
+        assert!(parse_mxc("mxc://ex.org/").is_err());
+        assert!(parse_mxc("mxc://").is_err());
+    }
+
+    #[tokio::test]
+    async fn download_media_uses_authenticated_endpoint() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/_matrix/client/v1/media/download/ex.org/abc123")
+            .match_header("authorization", format!("Bearer {TOKEN}").as_str())
+            .with_status(200)
+            .with_body(b"\x89PNG\r\n\x1a\nmatrixpng".as_slice())
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let bytes = download_media(&http, &server.url(), TOKEN, "mxc://ex.org/abc123")
+            .await
+            .expect("download should succeed");
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_media_http_error_surfaces() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let err = download_media(&http, &server.url(), TOKEN, "mxc://ex.org/x")
+            .await
+            .expect_err("404 should error");
+        assert!(
+            matches!(err, MatrixError::Http { status: 404, .. }),
             "got {err:?}"
         );
     }

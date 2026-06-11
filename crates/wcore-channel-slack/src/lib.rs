@@ -299,6 +299,19 @@ impl Channel for SlackChannel {
             .map_err(ChannelError::from)
     }
 
+    async fn fetch_media(
+        &self,
+        attachment: &wcore_channels::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let bot_token = self
+            .bot_token
+            .as_deref()
+            .ok_or_else(|| ChannelError::Auth("bot token not loaded".to_string()))?;
+        api::download_file(&self.http, &attachment.url, bot_token)
+            .await
+            .map_err(ChannelError::from)
+    }
+
     /// Verify a Slack Events API POST and enqueue any resulting event.
     ///
     /// Pulls the `X-Slack-Signature` + `X-Slack-Request-Timestamp` headers

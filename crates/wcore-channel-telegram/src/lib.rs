@@ -306,6 +306,19 @@ impl Channel for TelegramChannel {
             .map_err(ChannelError::from)
     }
 
+    /// Download inbound media bytes. Telegram's `Attachment.url` is already a
+    /// fully-resolved HTTPS download URL (the bot token is embedded in the
+    /// file path by `getFile` resolution), so this is a plain
+    /// authenticated-by-URL GET.
+    async fn fetch_media(
+        &self,
+        attachment: &wcore_channels::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        api::download_bytes(&self.http, &attachment.url)
+            .await
+            .map_err(ChannelError::from)
+    }
+
     fn config_schema(&self) -> &str {
         include_str!("schemas/telegram.json")
     }

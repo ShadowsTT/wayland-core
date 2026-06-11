@@ -290,6 +290,15 @@ impl Channel for DiscordChannel {
         .await
         .map_err(ChannelError::from)
     }
+
+    async fn fetch_media(
+        &self,
+        attachment: &wcore_channels::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        rest::download_bytes(&self.http, &attachment.url)
+            .await
+            .map_err(ChannelError::from)
+    }
 }
 
 // ===========================================================================

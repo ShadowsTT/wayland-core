@@ -2215,21 +2215,25 @@ impl AgentBootstrap {
                         .collect();
 
                 // Inbound-media enricher: resolve image/audio attachments to
-                // derived text (description/transcript) before the turn
-                // prompt is built, reusing the SAME backends + SSRF-safe
-                // fetchers the agent's vision/transcribe tools use. Inert
-                // (and skipped) when neither backend has an API key wired.
+                // derived text (description/transcript) before the turn prompt
+                // is built. Bytes are fetched through the originating connector
+                // (auth-aware: the connector uses its own token), then the
+                // host-wired vision/transcription backend derives the text.
+                // Inert (and skipped) when neither backend has an API key.
                 let media_enricher = {
-                    let enricher = crate::channel_media::ChannelMediaEnricher::new(
-                        crate::tool_backends::build_vision_backend(),
-                        crate::tool_backends::build_image_fetcher(),
-                        crate::tool_backends::build_transcription_backend(),
-                        crate::tool_backends::build_audio_fetcher(),
-                    );
-                    if enricher.is_inert() {
+                    let vision = crate::tool_backends::build_vision_backend();
+                    let transcription = crate::tool_backends::build_transcription_backend();
+                    if vision.is_none() && transcription.is_none() {
                         None
                     } else {
-                        Some(Arc::new(enricher))
+                        let source = Arc::new(crate::channel_media::ManagerMediaSource::new(
+                            std::sync::Arc::clone(&lifted),
+                        ));
+                        Some(Arc::new(crate::channel_media::ChannelMediaEnricher::new(
+                            vision,
+                            transcription,
+                            source,
+                        )))
                     }
                 };
 

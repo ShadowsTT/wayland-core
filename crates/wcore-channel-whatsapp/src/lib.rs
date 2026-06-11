@@ -297,6 +297,28 @@ impl Channel for WhatsappChannel {
         .map_err(ChannelError::from)
     }
 
+    /// Download inbound WhatsApp media. `attachment.url` carries the Meta
+    /// media id (not a URL); `api::download_media` resolves it to a
+    /// short-lived URL then fetches the bytes, both hops bearer-authenticated.
+    async fn fetch_media(
+        &self,
+        attachment: &wcore_channels::Attachment,
+    ) -> Result<Vec<u8>, ChannelError> {
+        let access_token = self
+            .access_token
+            .as_deref()
+            .ok_or_else(|| ChannelError::Auth("access token not loaded".to_string()))?;
+        api::download_media(
+            &self.http,
+            &self.config.api_base_url,
+            &self.config.graph_version,
+            access_token,
+            &attachment.url,
+        )
+        .await
+        .map_err(ChannelError::from)
+    }
+
     /// Handle a Meta WhatsApp Cloud API webhook request.
     ///
     /// Meta drives two distinct flows over the same URL:

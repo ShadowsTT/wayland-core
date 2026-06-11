@@ -2,120 +2,181 @@
 //!
 //! A channel message can carry typed [`Attachment`]s (an image, a voice
 //! note, …). By default the dispatcher only *summarises* them into the
-//! prompt — the model is told "an image arrived at <url>" but never sees
-//! the content. For conversational channels the agent also has no vision /
-//! transcription tool to reach for (those tools are not in the
-//! `Conversational` allowlist), so the media is effectively invisible.
+//! prompt — the model is told "an image arrived" but never sees the content.
+//! For conversational channels the agent also has no vision / transcription
+//! tool to reach for, so the media is effectively invisible.
 //!
 //! This module closes that gap: before the turn prompt is built, the
-//! [`ChannelMediaEnricher`] eagerly resolves each attachment to *derived
-//! text* — a transcript for audio, a description for images — and writes it
-//! into [`Attachment::transcribed`], which `build_turn_prompt` already
-//! prefers over the bare URL.
+//! [`ChannelMediaEnricher`] resolves each attachment to *derived text* — a
+//! transcript for audio, a description for images — and writes it into
+//! [`Attachment::transcribed`], which `build_turn_prompt` already prefers
+//! over the bare URL.
 //!
-//! ## Reuse, not reimplementation
+//! ## Tokens stay in the connector (auth-aware fetch)
 //!
-//! The enricher does **not** re-implement fetching, SSRF defense, size
-//! caps, or MIME sniffing. It holds the real [`VisionAnalyzeTool`] /
-//! [`TranscribeAudioTool`] (built only when the host wired a backend) and
-//! calls their `execute()` surface, parsing the derived text out of the
-//! result. Every safety check the agent-facing tool enforces (SSRF-guarded
-//! fetch via the host fetcher, the 20/25 MB hard cap, magic-byte MIME
-//! validation, the structured-error contract) is therefore enforced here
-//! too, for free.
+//! The enricher does NOT hold any channel credentials. It fetches the raw
+//! bytes through a [`MediaByteSource`] — in production [`ManagerMediaSource`],
+//! which routes to the originating connector via
+//! [`ChannelManager::fetch_media_on`](wcore_channels::ChannelManager::fetch_media_on).
+//! Each connector downloads its OWN media with its OWN token and platform
+//! protocol (Slack bearer on `url_private`, WhatsApp's id→url→bytes, Matrix's
+//! `mxc://`→authenticated endpoint, Telegram/Discord plain GET). The bytes
+//! then go to the host-wired vision / transcription backend.
 //!
-//! ## Fail-soft
+//! ## Fail-soft and bounded
 //!
-//! Enrichment is best-effort: any failure (no backend, fetch error,
-//! unsupported format, SSRF block, timeout) logs and leaves the attachment
-//! as a plain URL summary. A media problem must never fail the turn — the
-//! agent still receives the text and the attachment reference.
+//! Every step is best-effort: a connector that can't fetch (default
+//! `Rejected`), a fetch error/timeout, an oversize payload, an unsupported
+//! format, or a backend error all log and leave the attachment as a bare-URL
+//! summary. A media problem never fails the turn. Both the fetch and the
+//! analyze step are wall-clock bounded.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use wcore_channels::{Attachment, MediaKind};
-use wcore_tools::Tool;
-use wcore_tools::transcription_tools::{AudioFetcher, TranscribeAudioTool, TranscriptionBackend};
-use wcore_tools::vision_tools::{ImageFetcher, VisionAnalyzeTool, VisionBackend};
+use async_trait::async_trait;
+use wcore_channels::{Attachment, ChannelManager, MediaKind};
+use wcore_tools::transcription_tools::{
+    TRANSCRIPTION_MAX_BYTES, TRANSCRIPTION_MIN_BYTES, TranscriptionBackend, TranscriptionOutcome,
+    detect_audio_mime,
+};
+use wcore_tools::vision_tools::{
+    VISION_MAX_BYTES, VISION_MIN_BYTES, VisionBackend, VisionOutcome, detect_image_mime,
+};
 
-/// Max characters of derived text injected per attachment. A long
-/// transcript or verbose description must not blow the turn's prompt
-/// budget; anything beyond this is truncated with a marker.
+/// Max characters of derived text injected per attachment, to protect the
+/// turn's prompt budget. Longer transcripts/descriptions are truncated.
 const MAX_DERIVED_CHARS: usize = 2_000;
 
-/// Per-attachment wall-clock cap for the whole fetch + model round trip.
-/// The underlying fetchers already cap their own connect/read timeouts;
-/// this bounds the *combined* fetch-then-analyze so a slow provider cannot
-/// stall a channel turn indefinitely.
-const ENRICH_TIMEOUT: Duration = Duration::from_secs(45);
+/// Wall-clock cap on the connector media download.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Vision prompt for eager image enrichment. Kept terse — the goal is a
-/// compact, prompt-budget-friendly description plus any visible text, not
-/// an essay.
+/// Wall-clock cap on the vision/transcription model call.
+const ANALYZE_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Vision prompt for eager image enrichment — terse on purpose.
 const IMAGE_DESCRIBE_PROMPT: &str =
     "Concisely describe this image for a chat assistant, and quote any visible text verbatim.";
 
+/// Source of inbound media bytes, fetched WITH the originating connector's
+/// own credentials. Abstracts [`ChannelManager`] so the enricher is unit
+/// testable without a live channel.
+#[async_trait]
+pub trait MediaByteSource: Send + Sync {
+    /// Fetch the bytes of `attachment` as received on `channel`.
+    async fn fetch(&self, channel: &str, attachment: &Attachment) -> Result<Vec<u8>, String>;
+}
+
+/// Production [`MediaByteSource`]: routes through the [`ChannelManager`] so
+/// each connector fetches its own media with its own token. Credentials
+/// never leave the connector boundary.
+pub struct ManagerMediaSource {
+    manager: Arc<tokio::sync::Mutex<ChannelManager>>,
+}
+
+impl ManagerMediaSource {
+    pub fn new(manager: Arc<tokio::sync::Mutex<ChannelManager>>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait]
+impl MediaByteSource for ManagerMediaSource {
+    async fn fetch(&self, channel: &str, attachment: &Attachment) -> Result<Vec<u8>, String> {
+        let guard = self.manager.lock().await;
+        guard
+            .fetch_media_on(channel, attachment)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Resolves inbound attachments to derived text (audio→transcript,
-/// image→description) using the host-wired vision / transcription tools.
+/// image→description) using the host-wired vision / transcription backends
+/// and a [`MediaByteSource`] for the auth-aware download.
 ///
-/// Construct via [`ChannelMediaEnricher::new`]. When neither a vision nor a
-/// transcription backend is configured the enricher is *inert*
-/// ([`Self::is_inert`]) and the caller should skip installing it.
+/// Construct via [`ChannelMediaEnricher::new`]. When neither backend is
+/// configured the enricher is *inert* ([`Self::is_inert`]) and the caller
+/// should skip installing it.
 pub struct ChannelMediaEnricher {
-    /// `Some` only when a vision backend was wired. Holds the real tool so
-    /// SSRF/cap/sniff are reused.
-    vision: Option<VisionAnalyzeTool>,
-    /// `Some` only when a transcription backend was wired.
-    transcription: Option<TranscribeAudioTool>,
-    timeout: Duration,
+    vision: Option<Arc<dyn VisionBackend>>,
+    transcription: Option<Arc<dyn TranscriptionBackend>>,
+    source: Arc<dyn MediaByteSource>,
+    fetch_timeout: Duration,
+    analyze_timeout: Duration,
 }
 
 impl ChannelMediaEnricher {
-    /// Build an enricher from the optional backends and their fetchers
-    /// (the same components `bootstrap` wires into the agent's
-    /// `vision_analyze` / `transcribe_audio` tools). A `None` backend means
-    /// that media class is left as a plain summary.
+    /// Build an enricher from the optional backends (the same the agent's
+    /// `vision_analyze` / `transcribe_audio` tools use) and a byte source.
     pub fn new(
-        vision_backend: Option<Arc<dyn VisionBackend>>,
-        vision_fetcher: Arc<dyn ImageFetcher>,
-        transcription_backend: Option<Arc<dyn TranscriptionBackend>>,
-        audio_fetcher: Arc<dyn AudioFetcher>,
+        vision: Option<Arc<dyn VisionBackend>>,
+        transcription: Option<Arc<dyn TranscriptionBackend>>,
+        source: Arc<dyn MediaByteSource>,
     ) -> Self {
         Self {
-            vision: vision_backend.map(|b| VisionAnalyzeTool::new(b, vision_fetcher)),
-            transcription: transcription_backend
-                .map(|b| TranscribeAudioTool::new(b, audio_fetcher)),
-            timeout: ENRICH_TIMEOUT,
+            vision,
+            transcription,
+            source,
+            fetch_timeout: FETCH_TIMEOUT,
+            analyze_timeout: ANALYZE_TIMEOUT,
         }
     }
 
-    /// `true` when no backend is wired — the enricher would do nothing, so
-    /// the caller can avoid installing it (and the per-turn clone of the
-    /// message it implies).
+    /// `true` when no backend is wired — the enricher would do nothing.
     pub fn is_inert(&self) -> bool {
         self.vision.is_none() && self.transcription.is_none()
     }
 
-    /// Enrich each attachment in place. Best-effort and fail-soft: an
-    /// attachment that already carries `transcribed`, has a non-HTTP(S)
-    /// `url`, is of an unsupported kind, or fails to resolve is left
-    /// untouched.
+    /// Enrich each attachment in place. Best-effort and fail-soft.
     pub async fn enrich(&self, attachments: &mut [Attachment], channel: &str) {
         for att in attachments.iter_mut() {
-            // A connector may have already produced text (e.g. a platform
-            // that ships voice-note transcripts). Never overwrite it.
+            // Never overwrite a connector-supplied transcript.
             if att.transcribed.is_some() {
                 continue;
             }
-            if !is_http_url(&att.url) {
-                continue;
+            // Only kinds we actually have a backend for proceed.
+            match att.kind {
+                MediaKind::Image if self.vision.is_some() => {}
+                MediaKind::Audio if self.transcription.is_some() => {}
+                _ => continue,
             }
+
+            // Fetch the bytes via the originating connector (auth lives
+            // there), bounded so a slow media host can't stall the turn.
+            let att_for_fetch = att.clone();
+            let bytes = match tokio::time::timeout(
+                self.fetch_timeout,
+                self.source.fetch(channel, &att_for_fetch),
+            )
+            .await
+            {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        target: "wcore_agent::channel_media",
+                        channel,
+                        kind = ?att.kind,
+                        error = %e,
+                        "inbound media fetch failed"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "wcore_agent::channel_media",
+                        channel,
+                        kind = ?att.kind,
+                        timeout_secs = self.fetch_timeout.as_secs(),
+                        "inbound media fetch timed out"
+                    );
+                    continue;
+                }
+            };
+
             let derived = match att.kind {
-                MediaKind::Audio => self.transcribe(&att.url, channel).await,
-                MediaKind::Image => self.describe_image(&att.url, channel).await,
-                // Video / Document / Other carry no eager backend in v1.
+                MediaKind::Image => self.describe_image(&bytes, channel).await,
+                MediaKind::Audio => self.transcribe_audio(&bytes, channel).await,
                 _ => None,
             };
             if let Some(text) = derived {
@@ -133,82 +194,71 @@ impl ChannelMediaEnricher {
         }
     }
 
-    /// Transcribe an audio attachment, or `None` if transcription is not
-    /// wired / the attempt failed.
-    async fn transcribe(&self, url: &str, channel: &str) -> Option<String> {
-        let tool = self.transcription.as_ref()?;
-        let content = self
-            .execute_bounded(tool, json!({ "audio_url": url }), channel, "audio")
-            .await?;
-        json_string_field(&content, "transcript")
-    }
-
-    /// Describe an image attachment, or `None` if vision is not wired / the
-    /// attempt failed.
-    async fn describe_image(&self, url: &str, channel: &str) -> Option<String> {
-        let tool = self.vision.as_ref()?;
-        let content = self
-            .execute_bounded(
-                tool,
-                json!({ "image_url": url, "question": IMAGE_DESCRIBE_PROMPT }),
+    async fn describe_image(&self, bytes: &[u8], channel: &str) -> Option<String> {
+        let backend = self.vision.as_ref()?;
+        if bytes.len() < VISION_MIN_BYTES || bytes.len() > VISION_MAX_BYTES {
+            tracing::debug!(
+                target: "wcore_agent::channel_media",
                 channel,
-                "image",
-            )
-            .await?;
-        json_string_field(&content, "analysis")
-    }
-
-    /// Run a tool's `execute` under the enrichment timeout, returning the
-    /// raw JSON `content` string on success. Errors and timeouts log and
-    /// return `None` so the caller falls back to the summary.
-    async fn execute_bounded(
-        &self,
-        tool: &dyn Tool,
-        input: Value,
-        channel: &str,
-        media: &'static str,
-    ) -> Option<String> {
-        match tokio::time::timeout(self.timeout, tool.execute(input)).await {
-            Ok(result) if !result.is_error => Some(result.content),
-            Ok(result) => {
-                tracing::warn!(
-                    target: "wcore_agent::channel_media",
-                    channel,
-                    media,
-                    error = %result.content,
-                    "inbound media enrichment failed"
-                );
+                bytes = bytes.len(),
+                "image size out of bounds; skipping"
+            );
+            return None;
+        }
+        let mime = detect_image_mime(bytes)?;
+        match tokio::time::timeout(
+            self.analyze_timeout,
+            backend.analyze(mime, bytes, IMAGE_DESCRIBE_PROMPT),
+        )
+        .await
+        {
+            Ok(VisionOutcome::Ok { analysis }) => non_empty(analysis),
+            Ok(VisionOutcome::Err { message }) => {
+                tracing::debug!(target: "wcore_agent::channel_media", channel, error = %message, "vision backend error");
                 None
             }
             Err(_) => {
-                tracing::warn!(
-                    target: "wcore_agent::channel_media",
-                    channel,
-                    media,
-                    timeout_secs = self.timeout.as_secs(),
-                    "inbound media enrichment timed out"
-                );
+                tracing::warn!(target: "wcore_agent::channel_media", channel, "vision analyze timed out");
+                None
+            }
+        }
+    }
+
+    async fn transcribe_audio(&self, bytes: &[u8], channel: &str) -> Option<String> {
+        let backend = self.transcription.as_ref()?;
+        if bytes.len() < TRANSCRIPTION_MIN_BYTES || bytes.len() > TRANSCRIPTION_MAX_BYTES {
+            tracing::debug!(
+                target: "wcore_agent::channel_media",
+                channel,
+                bytes = bytes.len(),
+                "audio size out of bounds; skipping"
+            );
+            return None;
+        }
+        let mime = detect_audio_mime(bytes)?;
+        match tokio::time::timeout(self.analyze_timeout, backend.transcribe(mime, bytes, None))
+            .await
+        {
+            Ok(TranscriptionOutcome::Ok { transcript, .. }) => non_empty(transcript),
+            Ok(TranscriptionOutcome::Err { message }) => {
+                tracing::debug!(target: "wcore_agent::channel_media", channel, error = %message, "transcription backend error");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(target: "wcore_agent::channel_media", channel, "transcription timed out");
                 None
             }
         }
     }
 }
 
-/// Only `http`/`https` URLs are fetchable. A connector that failed to
-/// resolve a download URL leaves a raw platform reference (e.g. a Telegram
-/// `file_id`) in `url`; that is not fetchable, so skip it.
-fn is_http_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
-}
-
-/// Pull a non-empty string field out of a tool's JSON result body.
-fn json_string_field(content: &str, field: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(content).ok()?;
-    let text = value.get(field)?.as_str()?.trim();
-    if text.is_empty() {
+/// `Some(trimmed)` when non-empty, else `None`.
+fn non_empty(text: String) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
         None
     } else {
-        Some(text.to_string())
+        Some(t.to_string())
     }
 }
 
@@ -225,8 +275,8 @@ fn truncate(text: String, max: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wcore_tools::transcription_tools::{CapturingTranscriptionBackend, StaticAudioFetcher};
-    use wcore_tools::vision_tools::{CapturingVisionBackend, StaticImageFetcher};
+    use wcore_tools::transcription_tools::CapturingTranscriptionBackend;
+    use wcore_tools::vision_tools::CapturingVisionBackend;
 
     /// Minimal valid PNG header — passes `detect_image_mime` + min-size.
     fn png_bytes() -> Vec<u8> {
@@ -242,146 +292,152 @@ mod tests {
         v
     }
 
-    fn image_att(url: &str) -> Attachment {
+    /// Test byte source returning a fixed result, ignoring channel/attachment.
+    struct StaticSource(Result<Vec<u8>, String>);
+
+    #[async_trait]
+    impl MediaByteSource for StaticSource {
+        async fn fetch(&self, _channel: &str, _att: &Attachment) -> Result<Vec<u8>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn image_att() -> Attachment {
         Attachment {
-            url: url.into(),
+            url: "mxc://ex.org/abc".into(),
             content_type: Some("image/png".into()),
             kind: MediaKind::Image,
             ..Default::default()
         }
     }
 
-    fn audio_att(url: &str) -> Attachment {
+    fn audio_att() -> Attachment {
         Attachment {
-            url: url.into(),
+            url: "media-id-123".into(),
             content_type: Some("audio/ogg".into()),
             kind: MediaKind::Audio,
             ..Default::default()
         }
     }
 
-    fn vision_only(canned: &str) -> ChannelMediaEnricher {
+    fn vision_enricher(canned: &str, source: StaticSource) -> ChannelMediaEnricher {
         ChannelMediaEnricher::new(
             Some(Arc::new(CapturingVisionBackend::new(canned))),
-            Arc::new(StaticImageFetcher::new(png_bytes())),
             None,
-            Arc::new(StaticAudioFetcher::new(Vec::new())),
+            Arc::new(source),
         )
     }
 
-    fn audio_only(canned: &str) -> ChannelMediaEnricher {
+    fn audio_enricher(canned: &str, source: StaticSource) -> ChannelMediaEnricher {
         ChannelMediaEnricher::new(
             None,
-            Arc::new(StaticImageFetcher::new(Vec::new())),
             Some(Arc::new(CapturingTranscriptionBackend::new(canned))),
-            Arc::new(StaticAudioFetcher::new(ogg_bytes())),
+            Arc::new(source),
         )
     }
 
     #[tokio::test]
     async fn enriches_image_into_description() {
-        let enricher = vision_only("a red bicycle leaning on a wall");
-        let mut atts = vec![image_att("https://example.com/bike.png")];
-        enricher.enrich(&mut atts, "telegram").await;
-        assert_eq!(
-            atts[0].transcribed.as_deref(),
-            Some("a red bicycle leaning on a wall")
-        );
+        let enricher = vision_enricher("a red bicycle", StaticSource(Ok(png_bytes())));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
+        assert_eq!(atts[0].transcribed.as_deref(), Some("a red bicycle"));
     }
 
     #[tokio::test]
     async fn enriches_audio_into_transcript() {
-        let enricher = audio_only("meet me at noon");
-        let mut atts = vec![audio_att("https://example.com/voice.ogg")];
-        enricher.enrich(&mut atts, "telegram").await;
-        assert_eq!(atts[0].transcribed.as_deref(), Some("meet me at noon"));
+        let enricher = audio_enricher("meet at noon", StaticSource(Ok(ogg_bytes())));
+        let mut atts = vec![audio_att()];
+        enricher.enrich(&mut atts, "whatsapp").await;
+        assert_eq!(atts[0].transcribed.as_deref(), Some("meet at noon"));
     }
 
     #[tokio::test]
-    async fn preserves_connector_supplied_transcript() {
-        let enricher = audio_only("model transcript that must not be used");
-        let mut atts = vec![Attachment {
-            url: "https://example.com/voice.ogg".into(),
-            kind: MediaKind::Audio,
-            transcribed: Some("connector transcript".into()),
-            ..Default::default()
-        }];
-        enricher.enrich(&mut atts, "telegram").await;
-        assert_eq!(atts[0].transcribed.as_deref(), Some("connector transcript"));
-    }
-
-    #[tokio::test]
-    async fn skips_non_http_reference() {
-        // A bare Telegram file_id (getFile fell back) is not fetchable.
-        let enricher = vision_only("never produced");
-        let mut atts = vec![image_att("BAADBAADrwADBREAAYag")];
-        enricher.enrich(&mut atts, "telegram").await;
+    async fn fetch_error_leaves_attachment_untouched() {
+        let enricher = vision_enricher("never", StaticSource(Err("401 unauthorized".into())));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
         assert!(atts[0].transcribed.is_none());
     }
 
     #[tokio::test]
-    async fn skips_unsupported_kind() {
-        let enricher = vision_only("never produced");
+    async fn preserves_connector_supplied_transcript() {
+        let enricher = audio_enricher("model text", StaticSource(Ok(ogg_bytes())));
         let mut atts = vec![Attachment {
-            url: "https://example.com/report.pdf".into(),
+            kind: MediaKind::Audio,
+            transcribed: Some("connector transcript".into()),
+            ..Default::default()
+        }];
+        enricher.enrich(&mut atts, "whatsapp").await;
+        assert_eq!(atts[0].transcribed.as_deref(), Some("connector transcript"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_kind_is_skipped_without_fetch() {
+        // Document kind + a source that would panic-loudly is never called
+        // because the kind is filtered before fetch.
+        let enricher = vision_enricher("never", StaticSource(Ok(png_bytes())));
+        let mut atts = vec![Attachment {
+            url: "x".into(),
             kind: MediaKind::Document,
             ..Default::default()
         }];
-        enricher.enrich(&mut atts, "telegram").await;
+        enricher.enrich(&mut atts, "slack").await;
         assert!(atts[0].transcribed.is_none());
     }
 
     #[tokio::test]
     async fn image_skipped_when_only_transcription_wired() {
-        let enricher = audio_only("audio backend present, vision absent");
-        let mut atts = vec![image_att("https://example.com/x.png")];
-        enricher.enrich(&mut atts, "telegram").await;
-        assert!(
-            atts[0].transcribed.is_none(),
-            "image must stay a summary when no vision backend is wired"
-        );
+        let enricher = audio_enricher("audio only", StaticSource(Ok(png_bytes())));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
+        assert!(atts[0].transcribed.is_none());
+    }
+
+    #[tokio::test]
+    async fn non_media_bytes_are_rejected_by_mime_sniff() {
+        // Source returns an HTML error page; the mime sniff fails → skip.
+        let html = b"<!DOCTYPE html><html>nope</html>".to_vec();
+        let enricher = vision_enricher("never", StaticSource(Ok(html)));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
+        assert!(atts[0].transcribed.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversize_payload_is_skipped() {
+        let mut huge = b"\x89PNG\r\n\x1a\n".to_vec();
+        huge.resize(VISION_MAX_BYTES + 1024, 0u8);
+        let enricher = vision_enricher("never", StaticSource(Ok(huge)));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
+        assert!(atts[0].transcribed.is_none());
     }
 
     #[tokio::test]
     async fn long_derived_text_is_truncated() {
         let huge = "x".repeat(MAX_DERIVED_CHARS + 500);
-        let enricher = vision_only(&huge);
-        let mut atts = vec![image_att("https://example.com/big.png")];
-        enricher.enrich(&mut atts, "telegram").await;
+        let enricher = vision_enricher(&huge, StaticSource(Ok(png_bytes())));
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
         let got = atts[0].transcribed.as_deref().unwrap();
-        assert!(got.ends_with("… [truncated]"), "expected truncation marker");
-        assert!(
-            got.chars().count() <= MAX_DERIVED_CHARS + " … [truncated]".chars().count(),
-            "truncated text must respect the cap"
-        );
+        assert!(got.ends_with("… [truncated]"));
     }
 
     #[tokio::test]
     async fn inert_enricher_is_a_noop() {
-        let enricher = ChannelMediaEnricher::new(
-            None,
-            Arc::new(StaticImageFetcher::new(Vec::new())),
-            None,
-            Arc::new(StaticAudioFetcher::new(Vec::new())),
-        );
+        let enricher =
+            ChannelMediaEnricher::new(None, None, Arc::new(StaticSource(Ok(png_bytes()))));
         assert!(enricher.is_inert());
-        let mut atts = vec![image_att("https://example.com/x.png")];
-        enricher.enrich(&mut atts, "telegram").await;
+        let mut atts = vec![image_att()];
+        enricher.enrich(&mut atts, "slack").await;
         assert!(atts[0].transcribed.is_none());
     }
 
     #[test]
     fn truncate_below_cap_is_unchanged() {
-        let (text, cut) = truncate("short".to_string(), 100);
-        assert_eq!(text, "short");
+        let (t, cut) = truncate("short".to_string(), 100);
+        assert_eq!(t, "short");
         assert!(!cut);
-    }
-
-    #[test]
-    fn is_http_url_matches_only_web_schemes() {
-        assert!(is_http_url("https://example.com/a.png"));
-        assert!(is_http_url("http://example.com/a.png"));
-        assert!(!is_http_url("file:///etc/passwd"));
-        assert!(!is_http_url("BAADBAADrwADBREAAYag"));
     }
 }

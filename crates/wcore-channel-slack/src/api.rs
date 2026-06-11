@@ -275,6 +275,43 @@ pub async fn add_reaction(
     Ok(())
 }
 
+/// Download a Slack `url_private` file with the bot token. Single attempt;
+/// the media enricher bounds it with its own timeout. Slack returns the raw
+/// bytes on success; an unauthorized request yields an HTML login page (the
+/// caller MIME-sniffs and rejects non-media), so only transport/HTTP errors
+/// surface here.
+pub async fn download_file(
+    http: &wcore_egress::EgressClient,
+    url: &str,
+    bot_token: &str,
+) -> Result<Vec<u8>, SlackError> {
+    let resp = http
+        .get(url)
+        .bearer_auth(bot_token)
+        .send()
+        .await
+        .map_err(|e| SlackError::Api(format!("media download send error: {e}")))?;
+    let status = resp.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(SlackError::Auth(format!(
+            "HTTP {}: {body}",
+            status.as_u16()
+        )));
+    }
+    if !status.is_success() {
+        return Err(SlackError::Api(format!(
+            "media download HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| SlackError::Api(format!("media body read: {e}")))?;
+    Ok(bytes.to_vec())
+}
+
 #[cfg(test)]
 mod reaction_tests {
     use super::*;
@@ -344,5 +381,38 @@ mod reaction_tests {
             matches!(err, SlackError::Api(ref c) if c == "message_not_found"),
             "got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn download_file_sends_bearer_and_returns_bytes() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/files/x.png")
+            .match_header("authorization", "Bearer xoxb-tok")
+            .with_status(200)
+            .with_body(b"\x89PNG\r\n\x1a\nslackpng".as_slice())
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let bytes = download_file(&http, &format!("{}/files/x.png", server.url()), "xoxb-tok")
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..4], b"\x89PNG");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn download_file_unauthorized_maps_to_auth() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(401)
+            .create_async()
+            .await;
+        let http = wcore_egress::EgressClient::new();
+        let err = download_file(&http, &format!("{}/x", server.url()), "tok")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SlackError::Auth(_)), "got {err:?}");
     }
 }

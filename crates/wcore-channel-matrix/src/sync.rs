@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::{Mutex, watch};
 
-use wcore_channels::event::{ChannelEvent, ChatType, IncomingMessage};
+use wcore_channels::event::{Attachment, ChannelEvent, ChatType, IncomingMessage, MediaKind};
 
 use crate::error::MatrixError;
 
@@ -88,6 +88,57 @@ struct MessageContent {
     /// `m.mentions` rich-mention block (MSC3952). We only read `user_ids`.
     #[serde(rename = "m.mentions", default)]
     mentions: Option<Mentions>,
+    /// `m.image` / `m.audio` / `m.video` / `m.file` for media events, else
+    /// `m.text` / `m.notice` / etc. Empty when absent.
+    #[serde(default)]
+    msgtype: String,
+    /// `mxc://server/id` content URI for UNENCRYPTED media. Encrypted rooms
+    /// carry media under `content.file` (with a decryption key) which this
+    /// raw-REST adapter does not handle (it can't read encrypted bodies
+    /// either) — so only plaintext-room media is surfaced.
+    #[serde(default)]
+    url: Option<String>,
+    /// Media `info` block — we only read `mimetype`.
+    #[serde(default)]
+    info: Option<MediaInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct MediaInfo {
+    #[serde(default)]
+    mimetype: Option<String>,
+}
+
+/// Map a Matrix `msgtype` to a coarse [`MediaKind`], or `None` for non-media
+/// message types (`m.text`, `m.notice`, …).
+fn media_kind_for(msgtype: &str) -> Option<MediaKind> {
+    match msgtype {
+        "m.image" => Some(MediaKind::Image),
+        "m.audio" => Some(MediaKind::Audio),
+        "m.video" => Some(MediaKind::Video),
+        "m.file" => Some(MediaKind::Document),
+        _ => None,
+    }
+}
+
+/// Build the typed attachment list for one message event. Only unencrypted
+/// media (a plain `mxc://` `url`) of a recognised media msgtype is mapped;
+/// everything else yields an empty list. The `mxc://` URI is carried in
+/// `Attachment.url` and resolved to bytes later via the connector's
+/// `fetch_media` (authenticated `/_matrix/client/v1/media/download`).
+fn attachments_for(content: &MessageContent) -> Vec<Attachment> {
+    let Some(kind) = media_kind_for(&content.msgtype) else {
+        return Vec::new();
+    };
+    let Some(url) = content.url.as_deref().filter(|u| u.starts_with("mxc://")) else {
+        return Vec::new();
+    };
+    vec![Attachment {
+        url: url.to_string(),
+        content_type: content.info.as_ref().and_then(|i| i.mimetype.clone()),
+        kind,
+        ..Default::default()
+    }]
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -261,6 +312,7 @@ fn parse_sync_events(resp: &SyncResponse, bot_user_id: &str) -> Vec<ChannelEvent
                 chat_type: ChatType::Group,
                 platform: Some("matrix".into()),
                 was_mentioned,
+                attachments: attachments_for(&ev.content),
                 ..IncomingMessage::new(
                     ev.event_id.clone(),
                     room_id.clone(),
@@ -435,5 +487,65 @@ mod tests {
         let body = r#"{ "next_batch": "s6_batch" }"#;
         let events = parse(body, BOT);
         assert!(events.is_empty());
+    }
+
+    // 6. An m.image message maps an Attachment carrying the mxc:// URI.
+    #[test]
+    fn maps_image_attachment_from_mxc() {
+        let body = r#"{
+            "next_batch": "s7",
+            "rooms": { "join": { "!r:ex.org": { "timeline": { "events": [
+                {
+                    "type": "m.room.message",
+                    "sender": "@alice:ex.org",
+                    "event_id": "$img",
+                    "origin_server_ts": 1700000050000,
+                    "content": {
+                        "msgtype": "m.image",
+                        "body": "cat.png",
+                        "url": "mxc://ex.org/abc123",
+                        "info": { "mimetype": "image/png" }
+                    }
+                }
+            ] } } } }
+        }"#;
+        let events = parse(body, BOT);
+        assert_eq!(events.len(), 1);
+        let ChannelEvent::MessageReceived { msg } = &events[0] else {
+            panic!("expected MessageReceived");
+        };
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].url, "mxc://ex.org/abc123");
+        assert_eq!(msg.attachments[0].kind, MediaKind::Image);
+        assert_eq!(
+            msg.attachments[0].content_type.as_deref(),
+            Some("image/png")
+        );
+    }
+
+    // 7. A plain m.text message has no attachments; an m.file with a
+    //    non-mxc url is ignored (encrypted/relative refs aren't fetchable).
+    #[test]
+    fn text_has_no_attachment_and_non_mxc_is_skipped() {
+        let text = r#"{ "next_batch": "s8", "rooms": { "join": { "!r:ex.org": { "timeline": { "events": [
+            { "type": "m.room.message", "sender": "@a:ex.org", "event_id": "$t", "origin_server_ts": 1700000060000,
+              "content": { "msgtype": "m.text", "body": "hello" } }
+        ] } } } } }"#;
+        let ChannelEvent::MessageReceived { msg } = &parse(text, BOT)[0] else {
+            panic!();
+        };
+        assert!(msg.attachments.is_empty());
+
+        let nonmxc = r#"{ "next_batch": "s9", "rooms": { "join": { "!r:ex.org": { "timeline": { "events": [
+            { "type": "m.room.message", "sender": "@a:ex.org", "event_id": "$f", "origin_server_ts": 1700000070000,
+              "content": { "msgtype": "m.file", "body": "doc", "url": "https://evil/x" } }
+        ] } } } } }"#;
+        let ChannelEvent::MessageReceived { msg } = &parse(nonmxc, BOT)[0] else {
+            panic!();
+        };
+        assert!(
+            msg.attachments.is_empty(),
+            "non-mxc media url must be skipped"
+        );
     }
 }

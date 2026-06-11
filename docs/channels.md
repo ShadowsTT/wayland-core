@@ -118,6 +118,34 @@ Ack failures never affect the reply itself. Per-connector support:
 Slack maps the ack emoji (👀/✅/❌) to its shortcodes (`eyes`/`white_check_mark`/`x`)
 because `reactions.add` takes a name, not a unicode glyph.
 
+## Inbound media (images & voice notes)
+
+When an inbound message carries an image or audio attachment, the agent
+turns it into text **before** the prompt is built: images become a short
+description, voice notes become a transcript (written into the attachment's
+derived-text slot). This needs a vision and/or transcription backend wired
+(an `ANTHROPIC`/`OPENAI`/`GEMINI` key for vision, a `GROQ`/`OPENAI` key for
+transcription); with neither configured the enricher is inert and media is
+left as a bare-URL summary.
+
+The bytes are downloaded by the **originating connector**, using that
+connector's own credentials and media protocol — credentials never leave the
+connector boundary (the agent-side enricher only sees bytes):
+
+| Connector | Inbound media fetch | Mechanism |
+|-----------|---------------------|-----------|
+| Telegram  | ✅ | `getFile` URL (token in path), plain GET |
+| Discord   | ✅ | public CDN URL, plain GET |
+| Slack     | ✅ | `url_private` + `Authorization: Bearer` (scope `files:read`) |
+| WhatsApp  | ✅ | media-id → `GET /<id>` (Bearer) → temp URL → GET (Bearer) |
+| Matrix    | ✅ | `mxc://` → `GET /_matrix/client/v1/media/download/{server}/{id}` (Bearer); **unencrypted rooms only** |
+| Signal / iMessage / email | — | no inbound-media mapping wired |
+
+Every step is best-effort and bounded: a fetch error/timeout, an oversize
+payload (>20 MB image / >25 MB audio), an unsupported format, or a backend
+error all fall back to the bare-URL summary and never fail the turn. Derived
+text is truncated to keep the prompt budget in check.
+
 ## Inbound webhook host (Slack / WhatsApp / Twilio SMS)
 
 Slack, WhatsApp, and Twilio SMS receive inbound messages as HTTP webhooks
