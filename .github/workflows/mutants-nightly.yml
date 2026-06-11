@@ -125,6 +125,13 @@ jobs:
         run: |
           mkdir -p .blackboard/E2E-MUTATION-BASELINE
 
+          # Clear any stale output from a cached `target/` restore. A leftover
+          # mutants.out/lock.json produced "Resource temporarily unavailable"
+          # lock waits, and a half-written run produced "File exists (os error
+          # 17)" — both crashed cargo-mutants before it printed a summary,
+          # which is what filed the empty "surviving mutants: none" issues.
+          rm -rf "target/mutants-${CRATE}"
+
           IN_PLACE_FLAG=""
           if [ "${IN_PLACE}" = "true" ]; then
             IN_PLACE_FLAG="--in-place"
@@ -140,14 +147,25 @@ jobs:
             --output "target/mutants-${CRATE}" \
             ${SHARD_ARG} \
             2>&1 | tee ".blackboard/E2E-MUTATION-BASELINE/${CRATE}.log"
-          MUTANTS_EXIT=$?
+          MUTANTS_EXIT=${PIPESTATUS[0]}   # cargo's code, not tee's
 
-          # Parse summary line
-          SUMMARY=$(grep "mutants tested in" ".blackboard/E2E-MUTATION-BASELINE/${CRATE}.log" | tail -1 || echo "no summary")
+          # Parse the summary line, e.g.
+          #   "54 mutants tested in 2m: 9 missed, 28 caught, 17 unviable".
+          # If the run crashed before printing it, the grep finds nothing and
+          # `real_data` is false — the report step then skips issue filing so
+          # we never post a content-free issue again.
+          SUMMARY=$(grep "mutants tested in" ".blackboard/E2E-MUTATION-BASELINE/${CRATE}.log" | tail -1)
+          if [ -n "${SUMMARY}" ]; then
+            REAL_DATA="true"
+          else
+            REAL_DATA="false"
+            SUMMARY="no summary (cargo-mutants did not complete — exit ${MUTANTS_EXIT})"
+          fi
+          echo "real_data=${REAL_DATA}" >> "$GITHUB_OUTPUT"
           echo "summary=${SUMMARY}" >> "$GITHUB_OUTPUT"
           echo "exit_code=${MUTANTS_EXIT}" >> "$GITHUB_OUTPUT"
 
-          # Compute catch rate
+          # Compute catch rate from the summary (0/N/A when there is none).
           CAUGHT=$(echo "${SUMMARY}" | grep -oE '[0-9]+ caught' | grep -oE '[0-9]+' || echo 0)
           MISSED=$(echo "${SUMMARY}" | grep -oE '[0-9]+ missed' | grep -oE '[0-9]+' || echo 0)
           VIABLE=$((CAUGHT + MISSED))
@@ -160,15 +178,22 @@ jobs:
           echo "caught=${CAUGHT}" >> "$GITHUB_OUTPUT"
           echo "missed=${MISSED}" >> "$GITHUB_OUTPUT"
 
-          # Collect missed mutants for the issue body
-          MISSED_LINES=$(grep "^MISSED" ".blackboard/E2E-MUTATION-BASELINE/${CRATE}.log" | head -20 || echo "none")
+          # Collect missed mutants for the issue body.
+          MISSED_LINES=$(grep "^MISSED" ".blackboard/E2E-MUTATION-BASELINE/${CRATE}.log" | head -20)
+          [ -z "${MISSED_LINES}" ] && MISSED_LINES="none"
           {
             printf 'missed_mutants<<MUTANTS_EOF\n'
             printf '%s\n' "${MISSED_LINES}"
             printf 'MUTANTS_EOF\n'
           } >> "$GITHUB_OUTPUT"
 
-          exit 0   # Always succeed the step; failures reported via issue
+          # Surface a crash as a visible workflow annotation (the uploaded log
+          # artifact has the detail) instead of an empty issue-tracker entry.
+          if [ "${REAL_DATA}" != "true" ]; then
+            echo "::warning title=mutants ${CRATE}::cargo-mutants did not produce a summary (exit ${MUTANTS_EXIT}); see the uploaded log artifact"
+          fi
+
+          exit 0   # Never fail the matrix leg; results flow via issue/annotation
         shell: bash
 
       # Safety: --in-place may leave mutated source if the job is cancelled.
@@ -190,9 +215,12 @@ jobs:
             target/mutants-${{ matrix.crate }}/mutants.out/
           retention-days: 30
 
-      # Open (or update) a GitHub issue when survived mutants detected
+      # Open (or update) a GitHub issue ONLY when cargo-mutants actually
+      # completed (real_data) AND found surviving mutants (missed != 0). A
+      # crash with no summary files no issue — it surfaces as the ::warning::
+      # annotation above instead, so the tracker never collects empty stubs.
       - name: Report red result to issue tracker
-        if: steps.mutants.outputs.exit_code != '0' || steps.mutants.outputs.missed != '0'
+        if: steps.mutants.outputs.real_data == 'true' && steps.mutants.outputs.missed != '0'
         uses: actions/github-script@v7
         env:
           CRATE: ${{ matrix.crate }}
