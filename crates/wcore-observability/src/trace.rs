@@ -70,6 +70,11 @@ pub struct ToolCallTrace {
     /// absent from v0.6.1 traces and from snippet-disabled runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_snippet: Option<String>,
+    /// `(raw_bytes, compacted_bytes)` when this tool call's output was
+    /// compacted by native Bash compaction. `None` when not compacted. Feeds
+    /// the `gain`-style savings report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_bytes: Option<(u64, u64)>,
     pub source_product: String,
 }
 
@@ -88,8 +93,15 @@ impl ToolCallTrace {
             cancelled: false,
             partial: false,
             result_snippet: None,
+            compaction_bytes: None,
             source_product: SOURCE_PRODUCT.to_string(),
         }
+    }
+
+    /// Record native Bash output-compaction savings on this trace. Stored as
+    /// `(raw_bytes, compacted_bytes)` for the savings report.
+    pub fn record_compaction(&mut self, raw_bytes: u64, compacted_bytes: u64) {
+        self.compaction_bytes = Some((raw_bytes, compacted_bytes));
     }
 
     /// Attach a `result_snippet`, truncating to `RESULT_SNIPPET_MAX` bytes
@@ -433,6 +445,21 @@ mod tests {
     fn tool_call_trace_new_sets_source_product() {
         let t = ToolCallTrace::new("c1".into(), "Read".into(), json!({}));
         assert_eq!(t.source_product, SOURCE_PRODUCT);
+    }
+
+    #[test]
+    fn tool_call_trace_round_trips_compaction_bytes() {
+        let mut t = ToolCallTrace::new("c1".into(), "Bash".into(), json!({}));
+        // Absent by default, and elided from the wire when None.
+        assert_eq!(t.compaction_bytes, None);
+        let none_json = serde_json::to_string(&t).unwrap();
+        assert!(!none_json.contains("compaction_bytes"));
+
+        t.record_compaction(1000, 200);
+        assert_eq!(t.compaction_bytes, Some((1000, 200)));
+        let s = serde_json::to_string(&t).unwrap();
+        let back: ToolCallTrace = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.compaction_bytes, Some((1000, 200)));
     }
 
     #[test]
