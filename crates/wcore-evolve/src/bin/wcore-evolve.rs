@@ -24,7 +24,9 @@ use wcore_evolve::mutator::{
     LlmParaphraseProvider, Mutator, Paraphrase, ParaphraseProvider, PassthroughParaphraseProvider,
     Precondition, Reorder, SwapSynonym,
 };
+use wcore_evolve::prompt_store::PromptStore;
 use wcore_evolve::{EvolveParams, NullTraceSink, evolve};
+use wcore_memory::db::Db;
 use wcore_providers::LlmProvider;
 use wcore_providers::anthropic::AnthropicProvider;
 use wcore_skills::types::{ExecutionContext, LoadedFrom, SkillMetadata, SkillSource};
@@ -276,6 +278,25 @@ async fn main() -> ExitCode {
             format!("score_invalid(generation={generation},score_bits={score_bits:#x})")
         }
     };
+
+    // Persist the winning variant into the global tier's `evolved_prompts`
+    // table so future runs (and the skills prioritizer's seed hydration) can
+    // bootstrap from past winners — without this the GEPA loop's only durable
+    // output is dropped and `evolved_prompts` only ever sees bench-run winners.
+    // Mirrors the bench binary; on an unresolvable global Db (rare CI envs
+    // without HOME) we warn and skip rather than fail the run.
+    match wcore_memory::paths::global_db_path() {
+        Some(p) => match Db::open_global(p) {
+            Ok(db) => {
+                let store = PromptStore::new(Arc::new(db));
+                if let Err(e) = store.record_outcome(&parent_id, "default", &outcome) {
+                    eprintln!("warn: PromptStore.record_outcome failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("warn: PromptStore disabled — Db::open_global failed: {e}"),
+        },
+        None => eprintln!("warn: PromptStore disabled — no global memory dir resolvable"),
+    }
 
     println!("run_id={run_id}");
     println!("parent_id={parent_id}");
