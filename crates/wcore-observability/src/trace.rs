@@ -50,7 +50,13 @@ pub fn result_snippets_enabled() -> bool {
 pub struct ToolCallTrace {
     pub call_id: String,
     pub tool_name: String,
-    /// Sanitized via PrivacyFilter in a future hardening pass; raw for now.
+    /// Tool input, scrubbed for credentials/PII at construction via
+    /// [`wcore_safety::PIIScrubber`] (see [`ToolCallTrace::new`] / [`scrub_input`]).
+    /// Scrubbing happens here — not only at the `SpanSink`-level
+    /// `PiiScrubbingSink` (which scrubs serialized JSON) — so EVERY sink,
+    /// including non-JSON / stdout emitters that never round-trip through that
+    /// wrapper, sees the redacted value. Raw paths, command strings, and
+    /// secret-shaped fields never reach a sink verbatim.
     pub input: Value,
     /// Bounded summary (≤4096 chars); full output sits in storage.
     pub output_summary: String,
@@ -78,13 +84,48 @@ pub struct ToolCallTrace {
     pub source_product: String,
 }
 
+/// Scrub credentials/PII out of a tool-input `Value` BEFORE it is stored on a
+/// [`ToolCallTrace`]. Reuses the same [`wcore_safety::PIIScrubber`] that
+/// `PiiScrubbingSink` applies at the serialized-JSON level — here it runs
+/// structurally at construction so the redacted value is what every sink reads,
+/// not just the one JSON-scrubbing wrapper.
+///
+/// Strategy mirrors `PiiScrubbingSink::emit`: serialize → scrub → re-parse.
+/// Credentials can appear inside any string field at arbitrary nesting (e.g. a
+/// `Bash` command string or a path), so scrubbing the serialized form catches
+/// them all. On the fast path (no match) the scrubber returns `Cow::Borrowed`
+/// and the input is returned untouched — no allocation, no re-parse.
+fn scrub_input(input: Value) -> Value {
+    let raw = match serde_json::to_string(&input) {
+        Ok(raw) => raw,
+        // A serde_json::Value always serializes; if it somehow doesn't, keep
+        // the original rather than dropping the field.
+        Err(_) => return input,
+    };
+    match wcore_safety::PIIScrubber.scrub(&raw) {
+        // Nothing matched — return the original value unchanged.
+        std::borrow::Cow::Borrowed(_) => input,
+        // Something was redacted — re-parse the scrubbed JSON. If re-parsing
+        // ever fails (shouldn't, the scrubber preserves JSON structure), fall
+        // back to a string Value so the redacted text is still what's stored —
+        // never the raw input.
+        std::borrow::Cow::Owned(clean) => {
+            serde_json::from_str(&clean).unwrap_or(Value::String(clean))
+        }
+    }
+}
+
 impl ToolCallTrace {
     /// Construct a fresh `ToolCallTrace` with `source_product` already set.
+    ///
+    /// `input` is scrubbed for credentials/PII via [`scrub_input`] before being
+    /// stored, so secret-shaped fields (and credentials embedded in paths or
+    /// command strings) never reach any sink verbatim.
     pub fn new(call_id: String, tool_name: String, input: Value) -> Self {
         Self {
             call_id,
             tool_name,
-            input,
+            input: scrub_input(input),
             output_summary: String::new(),
             duration_ms: 0,
             bytes_in: 0,
@@ -516,6 +557,50 @@ mod tests {
     fn tool_call_trace_new_sets_source_product() {
         let t = ToolCallTrace::new("c1".into(), "Read".into(), json!({}));
         assert_eq!(t.source_product, SOURCE_PRODUCT);
+    }
+
+    #[test]
+    fn tool_call_trace_new_redacts_secret_in_input() {
+        // RANK 59 — a credential carried in a tool input must be redacted in
+        // the STORED `input` (structurally, at construction), so every sink —
+        // not just the JSON-scrubbing `PiiScrubbingSink` — sees the redacted
+        // value. An AWS access key (`AKIA` + 16 chars) is one of the scrubber's
+        // patterns.
+        let secret = "AKIAIOSFODNN7EXAMPLE"; // AKIA + 16 = a matching key
+        let t = ToolCallTrace::new(
+            "c1".into(),
+            "Bash".into(),
+            json!({ "api_key": secret, "command": format!("deploy --token {secret}") }),
+        );
+
+        // The stored value must not contain the raw secret anywhere.
+        let stored = serde_json::to_string(&t.input).unwrap();
+        assert!(
+            !stored.contains(secret),
+            "raw secret must not survive in stored input; got {stored}"
+        );
+        assert!(
+            !stored.contains("AKIA"),
+            "no raw key fragment may survive; got {stored}"
+        );
+        // And the redaction marker must be present in its place.
+        assert!(
+            stored.contains("[REDACTED:AWS_ACCESS_KEY]"),
+            "secret must be redacted in stored input; got {stored}"
+        );
+
+        // Structure is preserved: the keys still round-trip as an object.
+        assert!(t.input.get("api_key").is_some());
+        assert!(t.input.get("command").is_some());
+    }
+
+    #[test]
+    fn tool_call_trace_new_preserves_clean_input_unchanged() {
+        // No credentials → the input must round-trip byte-for-byte (fast path,
+        // no spurious re-serialization artifacts).
+        let raw = json!({ "path": "/etc/hosts", "limit": 100, "nested": [1, 2, 3] });
+        let t = ToolCallTrace::new("c1".into(), "Read".into(), raw.clone());
+        assert_eq!(t.input, raw);
     }
 
     #[test]
