@@ -280,15 +280,34 @@ impl Channel for TelegramChannel {
         }
 
         // ---- Attachments ------------------------------------------------
-        // Each attachment URL is fetched by Telegram itself via sendDocument
-        // (no local upload, no SSRF surface on our side). sendDocument works
-        // for arbitrary file URLs — images included — which keeps v1 simple.
-        for url in &msg.attachments {
-            let body = api::build_send_document(&msg.conversation_id, url, None, reply_to);
-            let result = api::send_document(&self.http, &self.api_base, token, &body)
-                .await
-                .map_err(ChannelError::from)?;
-            last_result = Some(result);
+        // Each attachment URL is fetched by Telegram itself (no local upload,
+        // no SSRF surface on our side). A single attachment goes out via
+        // sendDocument; two or more are batched into sendMediaGroup so the
+        // reply renders as ONE grouped message burning ONE rate slot rather
+        // than N. Telegram caps a media group at 10 items, so chunk anything
+        // larger into batches of 10. All items are sent as documents (matching
+        // the single-send path), which keeps the group homogeneous — documents
+        // can't be mixed with other media kinds in one group anyway.
+        const MEDIA_GROUP_MAX: usize = 10;
+        match msg.attachments.as_slice() {
+            [] => {}
+            [url] => {
+                let body = api::build_send_document(&msg.conversation_id, url, None, reply_to);
+                let result = api::send_document(&self.http, &self.api_base, token, &body)
+                    .await
+                    .map_err(ChannelError::from)?;
+                last_result = Some(result);
+            }
+            many => {
+                for chunk in many.chunks(MEDIA_GROUP_MAX) {
+                    let body =
+                        api::build_send_media_group(&msg.conversation_id, chunk, None, reply_to);
+                    let result = api::send_media_group(&self.http, &self.api_base, token, &body)
+                        .await
+                        .map_err(ChannelError::from)?;
+                    last_result = Some(result);
+                }
+            }
         }
 
         // `last_result` is always Some: we send text unless there are
@@ -1007,6 +1026,61 @@ parse_mode = "MarkdownV2"
         assert_eq!(receipt.id, "9");
         m_text.assert_async().await;
         m_doc.assert_async().await;
+        ch.stop().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // 11b. Outbound: 3 attachments go out as ONE sendMediaGroup call (with
+    //      3 document items) rather than 3 separate sendDocument sends — one
+    //      grouped message, one rate slot. Rank 84.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn outbound_multiple_attachments_send_one_media_group() {
+        let mut server = mockito::Server::new_async().await;
+        mock_delete_webhook(&mut server).await;
+        // sendDocument MUST NOT be called — the multi-attachment path batches.
+        let m_doc = server
+            .mock("POST", format!("/bot{TEST_TOKEN}/sendDocument").as_str())
+            .with_status(200)
+            .with_body(r#"{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":1}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        // Exactly ONE sendMediaGroup carrying all three document URLs; the
+        // caption-less group echoes back an array of three Messages.
+        let m_group = server
+            .mock("POST", format!("/bot{TEST_TOKEN}/sendMediaGroup").as_str())
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"chat_id":"1","media":[{"type":"document","media":"https://example.com/a.pdf"},{"type":"document","media":"https://example.com/b.png"},{"type":"document","media":"https://example.com/c.txt"}]}"#
+                    .to_string(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"ok":true,"result":[{"message_id":2,"date":2,"chat":{"id":1}},{"message_id":3,"date":3,"chat":{"id":1}},{"message_id":4,"date":4,"chat":{"id":1}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let creds = InMemoryCreds::with_token("telegram.test.bot_token", TEST_TOKEN);
+        let mut ch = TelegramChannel::with_api_base("test", cfg(), creds, server.url());
+        ch.start().await.unwrap();
+        let msg = OutgoingMessage {
+            conversation_id: "1".to_string(),
+            // Empty text so the send is attachments-only — isolates the group path.
+            text: String::new(),
+            reply_to: None,
+            attachments: vec![
+                "https://example.com/a.pdf".to_string(),
+                "https://example.com/b.png".to_string(),
+                "https://example.com/c.txt".to_string(),
+            ],
+        };
+        // Receipt reflects the last message of the group array.
+        let receipt = ch.send_message(msg).await.unwrap();
+        assert_eq!(receipt.id, "4");
+        m_doc.assert_async().await;
+        m_group.assert_async().await;
         ch.stop().await.unwrap();
     }
 

@@ -258,6 +258,32 @@ pub struct SendDocumentBody<'a> {
     pub reply_to_message_id: Option<i64>,
 }
 
+/// One `InputMedia` item inside a `sendMediaGroup` array. All items in a
+/// document media group carry `type: "document"`; `media` is the file URL
+/// Telegram fetches itself (same no-upload, no-SSRF model as `sendDocument`).
+/// `caption` rides on the first item only so the group renders one shared
+/// caption rather than N.
+#[derive(Debug, Clone, Serialize)]
+pub struct InputMediaDocument<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'a str,
+    pub media: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<&'a str>,
+}
+
+/// `sendMediaGroup` request body. Telegram accepts 2–10 `InputMedia` items
+/// and renders them as a single grouped message that burns one rate slot
+/// instead of N. We only ever build `document`-typed items (matching the
+/// single-send `sendDocument` path), so the group is always homogeneous.
+#[derive(Debug, Clone, Serialize)]
+pub struct SendMediaGroupBody<'a> {
+    pub chat_id: &'a str,
+    pub media: Vec<InputMediaDocument<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
+}
+
 /// `sendChatAction` request body. We always send `action: "typing"` — the
 /// only chat action this adapter emits. Telegram auto-expires the typing
 /// indicator after ~5s, so the subscriber refreshes it periodically.
@@ -408,6 +434,126 @@ async fn post_with_retry<B: Serialize>(
     }
 
     // Exhausted attempts. If the last failure was a 429, surface that.
+    if last_retry_after > 0 {
+        return Err(TelegramError::RateLimited {
+            retry_after_secs: last_retry_after,
+        });
+    }
+    Err(last_err)
+}
+
+/// POST a serializable body to a Telegram send endpoint that returns an
+/// ARRAY of `Message` (i.e. `sendMediaGroup`) and decode the LAST element,
+/// applying the same retry policy as [`post_with_retry`] (exponential backoff
+/// on 5xx / network, 429 `retry_after` honoured and capped, permanent
+/// short-circuit on other 4xx). Kept parallel to `post_with_retry` because the
+/// only difference is the success-envelope shape: `Vec<Message>` vs `Message`.
+async fn post_vec_with_retry<B: Serialize>(
+    http: &wcore_egress::EgressClient,
+    url: &str,
+    body: &B,
+) -> Result<Message, TelegramError> {
+    let mut last_err = TelegramError::Http("no attempts made".to_string());
+    let mut last_retry_after: u64 = 0;
+
+    for attempt in 0..SEND_MAX_ATTEMPTS {
+        if attempt > 0 {
+            let sleep_ms = exp_backoff_ms(attempt);
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        }
+
+        let resp = match http
+            .post(url)
+            .json(body)
+            .timeout(SEND_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = TelegramError::Http(format!("network: {e}"));
+                continue;
+            }
+        };
+
+        let status = resp.status();
+
+        // 4xx (except 429) is permanent — short-circuit.
+        if status.is_client_error() && status.as_u16() != 429 {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let api: ApiResponse<serde_json::Value> =
+                serde_json::from_slice(&bytes).unwrap_or(ApiResponse {
+                    ok: false,
+                    result: None,
+                    description: Some(format!("status {status}")),
+                    error_code: Some(status.as_u16() as i64),
+                    parameters: None,
+                });
+            let code = api.error_code.unwrap_or(status.as_u16() as i64);
+            let desc = api
+                .description
+                .unwrap_or_else(|| format!("status {status}"));
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(TelegramError::Auth(desc));
+            }
+            return Err(TelegramError::Rejected {
+                code,
+                description: desc,
+            });
+        }
+
+        // 5xx — transient, back off and retry.
+        if status.is_server_error() {
+            last_err = TelegramError::Http(format!("server {status}"));
+            continue;
+        }
+
+        // 429 — honour parameters.retry_after, capped.
+        if status.as_u16() == 429 {
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let retry_after = serde_json::from_slice::<ApiResponse<serde_json::Value>>(&bytes)
+                .ok()
+                .and_then(|api| api.parameters)
+                .and_then(|p| p.retry_after)
+                .unwrap_or(1);
+            last_retry_after = retry_after;
+            let sleep_ms = (retry_after.saturating_mul(1000)).min(SEND_MAX_BACKOFF_MS);
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            last_err = TelegramError::RateLimited {
+                retry_after_secs: retry_after,
+            };
+            continue;
+        }
+
+        // 2xx — parse the envelope (an array of Messages).
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                last_err = TelegramError::Http(format!("body read: {e}"));
+                continue;
+            }
+        };
+        let api: ApiResponse<Vec<Message>> = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => return Err(TelegramError::Decode(e.to_string())),
+        };
+        if !api.ok {
+            return Err(TelegramError::ApiNotOk(
+                api.description.unwrap_or_else(|| "ok=false".to_string()),
+            ));
+        }
+        // Take the LAST message so the receipt reflects the final accepted
+        // item of the group, consistent with the single-send last-result rule.
+        match api.result.and_then(|mut v| v.pop()) {
+            Some(m) => return Ok(m),
+            None => {
+                return Err(TelegramError::ApiNotOk(
+                    "ok=true but empty media group result".to_string(),
+                ));
+            }
+        }
+    }
+
     if last_retry_after > 0 {
         return Err(TelegramError::RateLimited {
             retry_after_secs: last_retry_after,
@@ -589,6 +735,49 @@ pub(crate) async fn send_document(
 ) -> Result<Message, TelegramError> {
     let url = format!("{api_base}/bot{bot_token}/sendDocument");
     post_with_retry(http, &url, body).await
+}
+
+/// Build a `sendMediaGroup` body from a slice of attachment URLs. The shared
+/// `caption` rides on the first item only (Telegram's grouped-caption rule);
+/// every item is `type: "document"` to mirror the single-send `sendDocument`
+/// path. Factored out so the array shape is testable without a network round-trip.
+pub(crate) fn build_send_media_group<'a>(
+    chat_id: &'a str,
+    urls: &'a [String],
+    caption: Option<&'a str>,
+    reply_to_message_id: Option<i64>,
+) -> SendMediaGroupBody<'a> {
+    let media = urls
+        .iter()
+        .enumerate()
+        .map(|(i, url)| InputMediaDocument {
+            kind: "document",
+            media: url.as_str(),
+            // Caption on the first item only — Telegram renders it as the
+            // single shared caption for the whole group.
+            caption: if i == 0 { caption } else { None },
+        })
+        .collect();
+    SendMediaGroupBody {
+        chat_id,
+        media,
+        reply_to_message_id,
+    }
+}
+
+/// Send a batch of attachments via `sendMediaGroup`, reusing the same retry
+/// policy as [`send_message`]. Telegram fetches each `media` URL itself.
+/// Returns the LAST `Message` of the array Telegram echoes back so the caller
+/// can build a receipt from it (mirrors how the single-send path tracks the
+/// last accepted send).
+pub(crate) async fn send_media_group(
+    http: &wcore_egress::EgressClient,
+    api_base: &str,
+    bot_token: &str,
+    body: &SendMediaGroupBody<'_>,
+) -> Result<Message, TelegramError> {
+    let url = format!("{api_base}/bot{bot_token}/sendMediaGroup");
+    post_vec_with_retry(http, &url, body).await
 }
 
 /// Build the `sendChatAction` body for a typing indicator. Factored out so
@@ -797,6 +986,41 @@ mod tests {
         // caption + reply_to_message_id skip-serialize when None.
         assert!(json.get("caption").is_none());
         assert!(json.get("reply_to_message_id").is_none());
+    }
+
+    #[test]
+    fn send_media_group_body_puts_caption_on_first_item_only() {
+        let urls = vec![
+            "https://x/a.pdf".to_string(),
+            "https://x/b.png".to_string(),
+            "https://x/c.txt".to_string(),
+        ];
+        let body = build_send_media_group("42", &urls, Some("shared"), Some(7));
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["chat_id"], "42");
+        assert_eq!(json["reply_to_message_id"], 7);
+        let media = json["media"].as_array().expect("media is an array");
+        assert_eq!(media.len(), 3);
+        // Every item is a document referencing its URL.
+        assert_eq!(media[0]["type"], "document");
+        assert_eq!(media[0]["media"], "https://x/a.pdf");
+        // Caption rides on the FIRST item only — Telegram's shared-caption rule.
+        assert_eq!(media[0]["caption"], "shared");
+        assert!(media[1].get("caption").is_none());
+        assert!(media[2].get("caption").is_none());
+    }
+
+    #[test]
+    fn send_media_group_body_omits_absent_optionals() {
+        let urls = vec!["https://x/a.pdf".to_string(), "https://x/b.png".to_string()];
+        let body = build_send_media_group("42", &urls, None, None);
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["chat_id"], "42");
+        // No caption anywhere and no reply target when both are None.
+        assert!(json.get("reply_to_message_id").is_none());
+        let media = json["media"].as_array().expect("media is an array");
+        assert!(media[0].get("caption").is_none());
+        assert!(media[1].get("caption").is_none());
     }
 
     #[test]
