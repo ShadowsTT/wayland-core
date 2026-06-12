@@ -22,6 +22,7 @@ use crate::compact::state::CompactState;
 use crate::compact::{auto, emergency, estimate, micro};
 use crate::confirm::ToolConfirmer;
 use crate::orchestration::ExecutionControl;
+use crate::orchestration::StreamingContext;
 use crate::orchestration::ToolCallOutcome;
 use crate::orchestration::graph::{ExecutionGraph, GraphContext, GraphError, NodeExecutor};
 use crate::orchestration::intent::IntentClassifier;
@@ -3809,7 +3810,13 @@ impl AgentEngine {
                 confirmer: self.confirmer.clone(),
                 compaction_level: self.compaction_level,
                 toon_enabled: self.toon_enabled,
-                streaming: None,
+                // W7 F4: wire tool-chunk streaming (e.g. BashTool live
+                // output) into the live dispatch path. Gated on the host
+                // advertising streaming support so this stays opt-in by
+                // capability — hosts that don't advertise it keep the
+                // buffered-output behaviour (None). The dispatcher further
+                // gates per-tool on `tool.supports_streaming()`.
+                streaming: build_turn_streaming_context(&self.output, &self.current_msg_id),
                 approval: approval_channel,
                 allow_list: self.allow_list.clone(),
                 // v0.6.1 CRIT-1: clone the optional gate into the per-turn
@@ -5880,6 +5887,85 @@ pub(crate) fn is_hook_lifecycle_line(line: &str) -> bool {
         || line.starts_with("on_turn_start fired")
         || line.starts_with("on_turn_end fired")
         || line.starts_with("on_session_end fired")
+}
+
+/// W7 F4: build the per-turn `StreamingContext` for tool-chunk streaming
+/// (e.g. BashTool live output). Returns `Some` only when the host has
+/// advertised streaming support via `OutputSink::streaming_tools_advertised`,
+/// keeping the feature opt-in by capability — hosts that don't advertise it
+/// keep the buffered-output behaviour (`None`). The orchestration dispatcher
+/// further gates per-tool on `tool.supports_streaming()`.
+fn build_turn_streaming_context(
+    output: &Arc<dyn OutputSink>,
+    msg_id: &str,
+) -> Option<StreamingContext> {
+    if output.streaming_tools_advertised() {
+        Some(StreamingContext {
+            output: output.clone(),
+            msg_id: msg_id.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod streaming_context_gate_tests {
+    use std::sync::Arc;
+
+    use wcore_types::message::FinishReason;
+
+    use super::build_turn_streaming_context;
+    use crate::output::OutputSink;
+
+    /// Minimal sink whose streaming-advertise gate is configurable.
+    struct GateSink {
+        advertised: bool,
+    }
+
+    impl OutputSink for GateSink {
+        fn emit_text_delta(&self, _: &str, _: &str) {}
+        fn emit_thinking(&self, _: &str, _: &str) {}
+        fn emit_tool_call(&self, _: &str, _: &str) {}
+        fn emit_tool_result(&self, _: &str, _: bool, _: &str) {}
+        fn emit_stream_start(&self, _: &str) {}
+        fn emit_stream_end(
+            &self,
+            _: &str,
+            _: usize,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: u64,
+            _: FinishReason,
+        ) {
+        }
+        fn emit_error(&self, _: &str, _: bool) {}
+        fn emit_info(&self, _: &str) {}
+        fn streaming_tools_advertised(&self) -> bool {
+            self.advertised
+        }
+    }
+
+    #[test]
+    fn streaming_context_some_only_when_host_advertises() {
+        // W7 F4 regression: the per-turn AgentExecutorConfig must carry a
+        // StreamingContext on live paths when the host advertises streaming
+        // support, and stay None otherwise. Before this fix the engine
+        // hardcoded `streaming: None`, leaving tool-chunk streaming dead on
+        // every production path despite full dispatch machinery existing.
+        let on: Arc<dyn OutputSink> = Arc::new(GateSink { advertised: true });
+        let ctx = build_turn_streaming_context(&on, "m-1");
+        let ctx = ctx.expect("streaming advertised => Some(StreamingContext)");
+        assert_eq!(ctx.msg_id, "m-1");
+        assert!(ctx.output.streaming_tools_advertised());
+
+        let off: Arc<dyn OutputSink> = Arc::new(GateSink { advertised: false });
+        assert!(
+            build_turn_streaming_context(&off, "m-1").is_none(),
+            "streaming NOT advertised => None (no behaviour change for hosts that don't opt in)"
+        );
+    }
 }
 
 /// Parse the leading `Exit code: N` line of a Bash tool result, defaulting to
