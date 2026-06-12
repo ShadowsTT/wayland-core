@@ -260,9 +260,16 @@ impl McpTransport for SseTransport {
         let body = serde_json::to_string(req)
             .map_err(|e| McpError::Transport(format!("JSON serialize error: {}", e)))?;
 
+        // Rank 25 — bound the POST send itself. `connect_timeout` (15s) only
+        // covers the TCP/TLS handshake and the response `oneshot` wait below
+        // only starts once the POST returns; neither bounds a server that
+        // accepts the connection but never reads the request body, which would
+        // otherwise park `send().await` forever. `.timeout()` bounds the whole
+        // request (send + headers) using the same per-request budget.
         let response = self
             .client
             .post(&self.post_url)
+            .timeout(self.request_timeout)
             .headers(self.headers.clone())
             .header("Content-Type", "application/json")
             .body(body)
@@ -510,6 +517,76 @@ mod tests {
         assert!(
             transport.pending.lock().await.is_empty(),
             "timed-out request must remove its pending oneshot"
+        );
+    }
+
+    /// Rank 25 — `SseTransport::request` must bound the POST `send()` itself,
+    /// not just the response `oneshot` wait that follows it. The failure mode
+    /// without the fix: a server that accepts the TCP connection but never
+    /// reads the request body nor responds parks `send().await` forever —
+    /// `connect_timeout` already elapsed (handshake completed) and the oneshot
+    /// timeout never starts because the POST never returns.
+    ///
+    /// The loopback server here accepts the connection and then goes silent
+    /// (never reading or replying), so only the `.timeout(request_timeout)` on
+    /// the POST builder can unblock the call. As in the C6 test, the transport
+    /// is constructed directly with a plain client so it can dial loopback
+    /// without tripping the production SSRF resolver.
+    #[tokio::test]
+    async fn rank25_post_send_times_out_when_server_never_reads_body() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::time::{Duration, Instant};
+
+        use reqwest::header::HeaderMap;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        use crate::protocol::JsonRpcRequest;
+        use crate::transport::McpTransport;
+
+        // Loopback server: accept the connection, then never read the body or
+        // write a response. The accepted socket is held (not dropped) so the
+        // client side stays connected with the POST in flight.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                // Park the socket open and silent.
+                held.push(socket);
+            }
+        });
+
+        let transport = SseTransport {
+            // Plain client (no `SsrfSafeResolver`) so it can dial loopback.
+            client: wcore_egress::EgressClient::new(),
+            post_url: format!("http://{addr}/post"),
+            headers: HeaderMap::new(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            _listener: tokio::spawn(async {}),
+            request_timeout: Duration::from_millis(500),
+        };
+
+        let req = JsonRpcRequest::new(1, "tools/call", None);
+        let start = Instant::now();
+        let result = transport.request(&req).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "a POST to a server that never reads the body must error, not hang"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("POST request failed"),
+            "expected the POST send to fail (timeout), got: {msg}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the POST send timeout must fire promptly, took {elapsed:?}"
         );
     }
 
