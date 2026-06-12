@@ -1012,6 +1012,37 @@ pub(crate) fn google_meet_token_status(path: &std::path::Path) -> GoogleMeetToke
     }
 }
 
+/// Resolve the `voice_mode` device status.
+///
+/// With the `voice` feature OFF the cpal backend isn't even linked, so we
+/// cannot claim anything about audio devices and report the honest "not
+/// probed" state (which is explicitly NOT an `is_ok()` value).
+///
+/// With the `voice` feature ON we run the same probe the tool itself uses to
+/// decide whether to expose itself — `CpalAudioRecorder::try_default()`, which
+/// returns `Some` iff the default host has a default INPUT device. A present
+/// device → `DeviceAvailable`; none (CI / container / SSH / headless host) →
+/// `DeviceUnavailable`. This mirrors `Tool::is_available()` so the badge can
+/// no longer be a permanent "device not probed" (D028).
+///
+/// `cpal` is pulled transitively through `wcore-agent/voice`; the cli's `voice`
+/// feature re-exports it. We call the probe through
+/// `wcore_agent::tool_backends::voice_mode` rather than depending on `cpal`
+/// directly (which would be a cross-crate dependency change).
+fn resolve_voice_mode_status() -> ProviderStatus {
+    #[cfg(feature = "voice")]
+    {
+        match wcore_agent::tool_backends::voice_mode::CpalAudioRecorder::try_default() {
+            Some(_) => ProviderStatus::DeviceAvailable,
+            None => ProviderStatus::DeviceUnavailable,
+        }
+    }
+    #[cfg(not(feature = "voice"))]
+    {
+        ProviderStatus::DeviceUnprobed
+    }
+}
+
 /// Resolve a provider entry's status by inspecting the env. The voice /
 /// google-meet cases need extra probes; everything else is the simple
 /// "any of these env vars is set?" check.
@@ -1020,12 +1051,7 @@ pub(crate) fn resolve_provider_status(entry: &ProviderEntry) -> ProviderStatus {
         return ProviderStatus::Deferred;
     }
     if entry.name == "voice_mode" {
-        // A real readiness claim needs a live cpal probe, which would pull
-        // `wcore-tools` into the config surface. Until that probe exists we
-        // must NOT assert "device ready" — that is a false status on any
-        // headless / no-audio host (D028). Report the honest "not probed"
-        // state, which is explicitly not an `is_ok()` value.
-        return ProviderStatus::DeviceUnprobed;
+        return resolve_voice_mode_status();
     }
     if entry.name == "google_meet" {
         // OAuth status is driven by the stored token file, not the client
@@ -2931,6 +2957,55 @@ mod tests {
         assert!(
             tool_count >= 10,
             "expected ≥10 non-deferred provider entries, got {tool_count}"
+        );
+    }
+
+    /// With the `voice` feature OFF the cpal backend is not linked, so we
+    /// cannot probe audio devices and MUST report the honest "not probed"
+    /// state (explicitly not an `is_ok()` value). This is the only path that
+    /// is deterministic regardless of build features (D028).
+    #[cfg(not(feature = "voice"))]
+    #[test]
+    fn voice_mode_status_is_unprobed_when_feature_off() {
+        let status = resolve_voice_mode_status();
+        assert_eq!(
+            status,
+            ProviderStatus::DeviceUnprobed,
+            "feature-off voice_mode must report DeviceUnprobed, not a false readiness claim"
+        );
+        assert!(!status.is_ok(), "DeviceUnprobed must never count as ready");
+    }
+
+    /// With the `voice` feature ON the resolver runs the same cpal probe the
+    /// tool itself uses (`CpalAudioRecorder::try_default()`): a present default
+    /// input device maps to `DeviceAvailable`, its absence (CI / container /
+    /// headless host) to `DeviceUnavailable`. The host may or may not have a
+    /// mic, so we assert the mapping matches the probe outcome — never the old
+    /// permanent `DeviceUnprobed`.
+    #[cfg(feature = "voice")]
+    #[test]
+    fn voice_mode_status_reflects_cpal_probe_when_feature_on() {
+        use wcore_agent::tool_backends::voice_mode::CpalAudioRecorder;
+        let status = resolve_voice_mode_status();
+        let device_present = CpalAudioRecorder::try_default().is_some();
+        let expected = if device_present {
+            ProviderStatus::DeviceAvailable
+        } else {
+            ProviderStatus::DeviceUnavailable
+        };
+        assert_eq!(
+            status, expected,
+            "feature-on voice_mode status must mirror the cpal input-device probe"
+        );
+        assert_ne!(
+            status,
+            ProviderStatus::DeviceUnprobed,
+            "feature-on voice_mode must not return the permanent 'not probed' badge"
+        );
+        assert_eq!(
+            status.is_ok(),
+            device_present,
+            "is_ok() must track whether an input device was actually found"
         );
     }
 
