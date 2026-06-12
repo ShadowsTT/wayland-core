@@ -41,13 +41,14 @@
 //! schema table), which [`WorkflowPlan::parse`] / [`WorkflowPlan::from_workflow`]
 //! build from the RON in a single pass alongside the existing lowering.
 //!
-//! ## Seams left for later tasks
+//! ## Schema validation and pipelining
 //!
-//! - **A4 (schema validation):** [`validate_stub`] is a no-op placeholder at
-//!   the agent-return site. Replace its call with `schema::validate(...)`.
-//! - **A5 (no-barrier pipeline):** linear chains dispatch per-stage here; the
-//!   item-level streaming mechanic lands in `pipeline.rs` and re-enters at the
-//!   marked dispatch site.
+//! - **Schema validation (A4):** `schema::validate(&result.text, schema)` runs
+//!   at every agent-return site (bounded by `MAX_SCHEMA_RETRIES`); there is no
+//!   stub placeholder.
+//! - **No-barrier pipeline (A5):** linear chains that opt into item-level
+//!   streaming dispatch through [`pipeline::run_pipeline`] rather than the
+//!   per-stage PassThrough path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
