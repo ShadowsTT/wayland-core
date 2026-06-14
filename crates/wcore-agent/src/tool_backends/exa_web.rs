@@ -130,3 +130,39 @@ impl WebBackend for ExaWebBackend {
         "exa"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live smoke test against the real Exa `/search` endpoint. `#[ignore]`d;
+    /// run with `EXA_API_KEY=… cargo test -p wcore-agent --lib
+    /// exa_web::tests::live_ -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live network + paid key: needs EXA_API_KEY"]
+    async fn live_exa_search_returns_results() {
+        let Some(key) = std::env::var("EXA_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!("SKIP live_exa: EXA_API_KEY unset");
+            return;
+        };
+        match ExaWebBackend::new(key)
+            .search("latest stable rust compiler version", 3)
+            .await
+        {
+            WebOutcome::Ok { payload } => {
+                let web = payload
+                    .get("web")
+                    .and_then(Value::as_array)
+                    .expect("web[] present");
+                assert!(!web.is_empty(), "expected >=1 exa result");
+                let url = web[0].get("url").and_then(Value::as_str).unwrap_or("");
+                assert!(url.starts_with("http"), "url must be http(s): {url}");
+                eprintln!("LIVE EXA OK — {} results; first: {url}", web.len());
+            }
+            WebOutcome::Err { message } => panic!("live exa returned Err: {message}"),
+        }
+    }
+}

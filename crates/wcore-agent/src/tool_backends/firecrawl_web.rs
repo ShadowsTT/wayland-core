@@ -134,3 +134,39 @@ impl WebBackend for FirecrawlWebBackend {
         "firecrawl"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live smoke test against the real Firecrawl `/v1/search` endpoint.
+    /// `#[ignore]`d; run with `FIRECRAWL_API_KEY=… cargo test -p wcore-agent
+    /// --lib firecrawl_web::tests::live_ -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "live network + paid key: needs FIRECRAWL_API_KEY"]
+    async fn live_firecrawl_search_returns_results() {
+        let Some(key) = std::env::var("FIRECRAWL_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            eprintln!("SKIP live_firecrawl: FIRECRAWL_API_KEY unset");
+            return;
+        };
+        match FirecrawlWebBackend::new(key)
+            .search("latest stable rust compiler version", 3)
+            .await
+        {
+            WebOutcome::Ok { payload } => {
+                let web = payload
+                    .get("web")
+                    .and_then(Value::as_array)
+                    .expect("web[] present");
+                assert!(!web.is_empty(), "expected >=1 firecrawl result");
+                let url = web[0].get("url").and_then(Value::as_str).unwrap_or("");
+                assert!(url.starts_with("http"), "url must be http(s): {url}");
+                eprintln!("LIVE FIRECRAWL OK — {} results; first: {url}", web.len());
+            }
+            WebOutcome::Err { message } => panic!("live firecrawl returned Err: {message}"),
+        }
+    }
+}
