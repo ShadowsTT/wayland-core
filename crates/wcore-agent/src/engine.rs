@@ -3644,6 +3644,24 @@ impl AgentEngine {
             }
             assistant_content.extend(tool_calls.clone());
 
+            // #86: a stream that completed WITHOUT a provider error but yielded
+            // no text, no thinking, and no tool calls is a silent dead-end —
+            // e.g. an OpenAI-compatible endpoint that returned 200 + `[DONE]`
+            // with zero deltas, or a response shape the SSE parser produced
+            // nothing from. Without this guard the turn commits an empty
+            // assistant message and returns with no output and no error, so the
+            // host shows nothing and the user can't tell what went wrong.
+            // Surface a visible, non-retryable error instead of the silent
+            // no-op. (Genuine content/tool-call/thinking turns are unaffected.)
+            if assistant_content.is_empty() {
+                self.output.emit_error(
+                    "Provider returned an empty response — no content and no tool calls. \
+                     The endpoint or model may be incompatible (verify it speaks the OpenAI \
+                     chat-completions streaming format and that the model name is valid).",
+                    false,
+                );
+            }
+
             self.messages
                 .push(Message::now(Role::Assistant, assistant_content));
 
