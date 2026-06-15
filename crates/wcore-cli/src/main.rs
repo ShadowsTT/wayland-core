@@ -1679,6 +1679,16 @@ async fn run_tui_mode(
             });
         }
     }
+    // A4c: servers dropped by the pre-connect reachability gate never reach a
+    // manager's `health()`, so surface them here as a distinct skipped (⊘) row.
+    for (name, reason) in &result.skipped_mcp_servers {
+        mcp_snapshot.push(tui::McpServerInfo {
+            name: name.clone(),
+            health: wcore_mcp::manager::McpServerHealth::Skipped {
+                reason: reason.clone(),
+            },
+        });
+    }
 
     // The `TuiEngine` controller keeps the last `tx` clone so it can
     // synthesize the `StreamEnd` the engine never emits itself.

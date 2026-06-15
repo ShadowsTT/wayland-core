@@ -1176,6 +1176,9 @@ pub enum McpServerStatus {
     },
     /// The server's connect attempt exceeded its per-server budget.
     TimedOut,
+    /// The server was skipped by a pre-connect gate (e.g. unreachable
+    /// command); reason explains why. Rendered as a skipped (⊘) row.
+    Skipped { reason: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────

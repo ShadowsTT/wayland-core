@@ -54,6 +54,10 @@ pub enum McpServerHealth {
     Failed { reason: String },
     /// Connect attempt exceeded the per-server budget before erroring.
     TimedOut { after: Duration },
+    /// Registration was skipped by a gate BEFORE any connect was attempted
+    /// (e.g. an unreachable transport command). No manager populates this —
+    /// it exists so a boot snapshot can carry skipped servers uniformly.
+    Skipped { reason: String },
 }
 
 /// Internal: the three-way result of one bounded connect attempt. Lets the

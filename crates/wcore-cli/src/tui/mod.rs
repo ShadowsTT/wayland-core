@@ -496,6 +496,11 @@ async fn run_loop(
                     wcore_mcp::manager::McpServerHealth::TimedOut { .. } => {
                         app::McpServerStatus::TimedOut
                     }
+                    wcore_mcp::manager::McpServerHealth::Skipped { reason } => {
+                        app::McpServerStatus::Skipped {
+                            reason: reason.clone(),
+                        }
+                    }
                 };
                 guard.mcp_status.insert(info.name.clone(), status);
             }

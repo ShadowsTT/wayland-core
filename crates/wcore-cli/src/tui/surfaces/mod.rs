@@ -2307,6 +2307,9 @@ fn render_mcp_list(inv: Option<&EngineInventory>) -> String {
             McpServerHealth::TimedOut { after } => {
                 format!("  ⏱ {}  (timed out after {after:?})\n", s.name)
             }
+            McpServerHealth::Skipped { reason } => {
+                format!("  ⊘ {}  (skipped: {reason})\n", s.name)
+            }
         };
         out.push_str(&line);
     }
@@ -3467,6 +3470,30 @@ mod tests {
         let hooks = render_hooks_list(Some(&inv));
         assert!(hooks.contains("Hooks registered (1)"));
         assert!(hooks.contains("lint-gate  [pre-tool-use]"));
+    }
+
+    #[test]
+    fn render_mcp_list_renders_skipped_server_with_glyph_a4c() {
+        use crate::tui::engine_bridge::McpServerInfo;
+
+        // A4c: a server dropped by the pre-connect reachability gate is carried
+        // in the inventory as `McpServerHealth::Skipped` and must render as a
+        // distinct ⊘ row explaining the skip — never silently absent.
+        let inv = EngineInventory {
+            skills: Vec::new(),
+            mcp_servers: vec![McpServerInfo {
+                name: "ghost-plugin".to_string(),
+                health: wcore_mcp::manager::McpServerHealth::Skipped {
+                    reason: "stdio command not launchable".to_string(),
+                },
+            }],
+            hooks: Vec::new(),
+        };
+
+        let mcp = render_mcp_list(Some(&inv));
+        assert!(mcp.contains('⊘'), "got: {mcp}");
+        assert!(mcp.contains("skipped"), "got: {mcp}");
+        assert!(mcp.contains("ghost-plugin"), "got: {mcp}");
     }
 
     #[test]

@@ -938,6 +938,9 @@ impl DiagnosticsSurface {
                     crate::tui::app::McpServerStatus::TimedOut => {
                         (HealthState::Fail, "timed out at connect".to_string())
                     }
+                    crate::tui::app::McpServerStatus::Skipped { reason } => {
+                        (HealthState::Warn, format!("⊘ skipped · {reason}"))
+                    }
                 };
                 lines.push(status_row(state, name, &detail, t));
             }
@@ -1827,6 +1830,14 @@ mod tests {
                 reason: "spawn node".into(),
             },
         );
+        // A4c: a server dropped by the pre-connect reachability gate shows as a
+        // distinct "skipped" row (Warn, not Fail — a skip is a decision).
+        app.mcp_status.insert(
+            "ghost-plugin".into(),
+            crate::tui::app::McpServerStatus::Skipped {
+                reason: "stdio command not launchable".into(),
+            },
+        );
         s.on_enter(&mut app);
         let out = render_tall(&mut s, &app);
         assert!(
@@ -1837,6 +1848,11 @@ mod tests {
         assert!(out.contains("ready"), "ready state missing:\n{out}");
         assert!(out.contains("claude-mem"), "failed server missing:\n{out}");
         assert!(out.contains("failed"), "failure state missing:\n{out}");
+        assert!(
+            out.contains("ghost-plugin"),
+            "skipped server missing:\n{out}"
+        );
+        assert!(out.contains("skipped"), "skipped state missing:\n{out}");
     }
 
     #[test]
