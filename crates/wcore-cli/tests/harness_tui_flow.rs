@@ -323,17 +323,19 @@ fn tui_renders_the_chrome_and_every_tab_on_boot() {
         "chrome wordmark missing on boot.\n--- screen ---\n{screen}\n--- end ---"
     );
 
-    // All six tab labels paint inline next to the wordmark. The
-    // `header.rs::top_chrome_shows_the_wordmark_and_every_tab` unit test
-    // asserts this in isolation; here we assert the same anchors land
-    // on a real PTY-rendered screen.
+    // All six tab labels paint inline next to the wordmark. These mirror
+    // `SurfaceId::TABS` (Plugins/Marketplace moved to the `/plugins` overlay,
+    // so they are no longer tab chrome). The
+    // `widgets/header.rs::top_chrome_shows_the_wordmark_and_every_tab` unit
+    // test asserts this in isolation; here we assert the same anchors land on a
+    // real PTY-rendered screen.
     for tab in [
         "Workspace",
         "Sub-Agents",
         "Plan",
         "Config",
-        "Plugins",
         "Diagnostics",
+        "Workflows",
     ] {
         assert!(
             screen.contains(tab),
