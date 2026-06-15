@@ -317,6 +317,12 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// A4b: when running --doctor, actually CONNECT-TEST each declared MCP
+    /// server (spawns stdio commands / dials URLs) instead of only listing
+    /// them. Off by default so bare --doctor stays side-effect-free.
+    #[arg(long, requires = "doctor")]
+    probe_mcp: bool,
+
     /// W4 F19: run the skills audit. Writes JSON to
     /// .wayland-core/skills-audit.json and renders Markdown to stdout.
     #[arg(long)]
@@ -939,7 +945,7 @@ async fn run() -> anyhow::Result<ExitCode> {
     // mode so a misconfigured environment can be diagnosed without
     // touching config files, OAuth, or the engine bootstrap.
     if cli.doctor {
-        return Ok(doctor::run().await);
+        return Ok(doctor::run(cli.probe_mcp).await);
     }
 
     // Handle --config-path
