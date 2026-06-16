@@ -940,6 +940,14 @@ pub enum ProviderType {
     /// `api.cohere.com/compatibility/v1`. Models: `command-r-plus`, etc.
     /// v0.8.1 U10 (F-025 fix): wired from orphan module to reachable arm.
     Cohere,
+    /// "Sign in with ChatGPT" — routes inference through the ChatGPT Codex
+    /// backend (`chatgpt.com/backend-api/codex`) using OAuth tokens from a
+    /// ChatGPT subscription instead of an OpenAI API key. Speaks the OpenAI
+    /// Responses wire format. The provider is constructed in `bootstrap`
+    /// (not `create_native_provider`) because it needs an OAuth-backed bearer
+    /// source that lives in `wcore-agent` (layering). Distinct from `OpenAI`,
+    /// which is API-key auth against `api.openai.com`.
+    OpenAIChatGpt,
 }
 
 impl ProviderType {
@@ -965,6 +973,10 @@ impl ProviderType {
                 | ProviderType::Qwen
                 | ProviderType::Mistral
                 | ProviderType::Cohere
+                // A7: ChatGPT Codex rides the OpenAI Responses wire format and
+                // its compat preset is built on `openai_compat_provider`, so it
+                // belongs to the OpenAI-compatible family for plumbing purposes.
+                | ProviderType::OpenAIChatGpt
         )
     }
 }
@@ -1026,6 +1038,9 @@ pub(crate) fn default_model_for(provider: ProviderType) -> &'static str {
         ProviderType::Moonshot | ProviderType::Qwen => "",
         // F-025: Mistral + Cohere have heterogeneous model catalogs; user sets model.
         ProviderType::Mistral | ProviderType::Cohere => "",
+        // ChatGPT Codex default: gpt-5.5 (the headline Codex model). See
+        // `wcore_types::model_aliases` codex consts for the full catalog.
+        ProviderType::OpenAIChatGpt => "gpt-5.5",
     }
 }
 
@@ -1148,6 +1163,12 @@ impl Config {
                 ProviderType::Moonshot | ProviderType::Qwen => String::new(),
                 // F-025: Mistral + Cohere fall back to their own default base URLs.
                 ProviderType::Mistral | ProviderType::Cohere => String::new(),
+                // ChatGPT Codex backend — NOT api.openai.com. The provider
+                // appends `/responses` to this base. Mirrors
+                // `wcore_providers::openai_chatgpt::CODEX_BASE_URL`.
+                ProviderType::OpenAIChatGpt => {
+                    "https://chatgpt.com/backend-api/codex".into()
+                }
             });
 
         let raw_model = cli
@@ -1279,6 +1300,9 @@ impl Config {
                 // F-025: Mistral + Cohere wired to reachable compat defaults.
                 ProviderType::Mistral => ProviderCompat::mistral_defaults(),
                 ProviderType::Cohere => ProviderCompat::cohere_defaults(),
+                // ChatGPT Codex: OpenAI Responses wire format, effort levels,
+                // provider id "openai-chatgpt" for cost attribution.
+                ProviderType::OpenAIChatGpt => ProviderCompat::chatgpt_defaults(),
             }
         };
 
@@ -1404,6 +1428,9 @@ fn parse_builtin_provider(s: &str) -> Option<ProviderType> {
         // plugins if local-runtime support is needed again.
         "mistral" => Some(ProviderType::Mistral),
         "cohere" => Some(ProviderType::Cohere),
+        // "Sign in with ChatGPT" — OAuth-backed Codex backend. "chatgpt" is the
+        // natural short alias; "openai-chatgpt" is the canonical id.
+        "openai-chatgpt" | "chatgpt" => Some(ProviderType::OpenAIChatGpt),
         _ => None,
     }
 }
@@ -1417,7 +1444,7 @@ pub const BUILTIN_PROVIDER_NAMES: &str = "anthropic, openai, bedrock, vertex, ge
      azure-openai (alias: azure), together, fireworks, nvidia, perplexity, \
      cerebras, openrouter, flux-router (alias: flux), deepseek, xai (alias: grok), \
      groq, moonshot (alias: kimi), qwen (aliases: alibaba, dashscope), \
-     mistral, cohere";
+     mistral, cohere, openai-chatgpt (alias: chatgpt)";
 
 fn merge_provider_configs(base: ProviderConfig, overlay: ProviderConfig) -> ProviderConfig {
     ProviderConfig {
@@ -1559,6 +1586,13 @@ fn resolve_api_key(
         ProviderType::Bedrock | ProviderType::Vertex => {
             return Ok(String::new());
         }
+        // ChatGPT Codex authenticates via OAuth tokens resolved out-of-band by
+        // the bootstrap-built bearer source (same shape as Bedrock/Vertex — no
+        // inline API key). Returning an empty key here keeps config resolution
+        // from erroring with MissingApiKey when no OPENAI_API_KEY is set.
+        ProviderType::OpenAIChatGpt => {
+            return Ok(String::new());
+        }
         ProviderType::Gemini => {
             // Native Gemini uses an API key (NOT GCP OAuth — that's Vertex).
             // Standard env vars per Google's CLI samples.
@@ -1682,6 +1716,8 @@ fn lookup_store_api_key(
         ProviderType::Anthropic => "providers.anthropic.api_key",
         ProviderType::OpenAI => "providers.openai.api_key",
         ProviderType::Bedrock | ProviderType::Vertex => return None,
+        // ChatGPT Codex has no credentials-store API key — auth is OAuth.
+        ProviderType::OpenAIChatGpt => return None,
         ProviderType::Gemini => "providers.gemini.api_key",
         // v0.6.3 Tier-2 providers — credentials store path keyed by id.
         ProviderType::AzureOpenAI => "providers.azure-openai.api_key",
@@ -2830,6 +2866,23 @@ mod tests {
             parse_builtin_provider("cerebras"),
             Some(ProviderType::Cerebras)
         );
+    }
+
+    #[test]
+    fn parses_chatgpt_provider_aliases() {
+        // Both the canonical id and the short alias resolve to the same type.
+        assert_eq!(
+            parse_builtin_provider("openai-chatgpt"),
+            Some(ProviderType::OpenAIChatGpt)
+        );
+        assert_eq!(
+            parse_builtin_provider("chatgpt"),
+            Some(ProviderType::OpenAIChatGpt)
+        );
+        // The Codex backend default model is gpt-5.5.
+        assert_eq!(default_model_for(ProviderType::OpenAIChatGpt), "gpt-5.5");
+        // It rides OpenAI-compat plumbing (A7).
+        assert!(ProviderType::OpenAIChatGpt.is_openai_compatible());
     }
 
     #[test]

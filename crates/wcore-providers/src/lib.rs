@@ -428,6 +428,20 @@ pub fn create_native_provider(config: &Config) -> Arc<dyn LlmProvider> {
                 }
             }
         }
+        // "Sign in with ChatGPT" cannot be built here: it needs an OAuth-backed
+        // async bearer source whose token store (`OAuthStorage`) lives in
+        // `wcore-agent`, which `wcore-providers` must NOT depend on (layering).
+        // `wcore-agent::bootstrap` special-cases this variant BEFORE calling
+        // `create_native_provider` and constructs `OpenAIChatGptProvider`
+        // directly with a bearer closure over `ChatGptTokenManager` (Phase 5).
+        // Reaching this arm means that special-case was bypassed — a bug.
+        ProviderType::OpenAIChatGpt => {
+            panic!(
+                "OpenAIChatGpt is constructed in bootstrap (with an OAuth bearer \
+                 source), not create_native_provider — this dispatch should never \
+                 be reached for the chatgpt provider"
+            )
+        }
     }
 }
 
