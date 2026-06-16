@@ -2502,6 +2502,68 @@ fn oauth_provider_signed_in(name: &str) -> Option<bool> {
     Some(signed_in)
 }
 
+/// Whether a built-in provider is ready to use right now, decided synchronously
+/// with no network or engine. Used by the `/provider` picker to separate
+/// usable providers from ones that would error on the first turn for lack of a
+/// credential. Mirrors the same three credential classes the engine's
+/// `resolve_api_key` (wcore-config) distinguishes:
+/// - **OAuth** (`openai-chatgpt`): ready when a stored login exists
+///   ([`oauth_provider_signed_in`]).
+/// - **Ambient cloud** (`bedrock`, `vertex`): always ready — they authenticate
+///   with AWS/GCP ambient credentials and carry no API key (their
+///   `resolve_api_key` arms return an empty string by design).
+/// - **API key** (`anthropic`, `openai`, `gemini`): ready when the provider's
+///   env var is set and non-empty — the same `std::env::var` non-empty check
+///   the `/config` surface's `resolve_provider_status` uses. The env-var names
+///   match `resolve_api_key`'s per-provider arms (single source of truth).
+///
+/// An unknown name is reported `NeedsKey` (conservative — the picker only ever
+/// passes [`wcore_types::model_aliases::known_providers`] names). `name` is the
+/// lowercased provider slug.
+fn provider_connection_status(name: &str) -> ProviderConnection {
+    // OAuth-backed providers: a stored login is the credential.
+    if let Some(signed_in) = oauth_provider_signed_in(name) {
+        return if signed_in {
+            ProviderConnection::Connected
+        } else {
+            ProviderConnection::NeedsKey
+        };
+    }
+    // Ambient cloud credentials — no API key, treated as available.
+    if matches!(name, "bedrock" | "vertex") {
+        return ProviderConnection::Connected;
+    }
+    // API-key providers: ready when the matching env var is set + non-empty.
+    let env_set = |k: &str| {
+        std::env::var(k)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    };
+    let connected = match name {
+        "anthropic" => env_set("ANTHROPIC_API_KEY"),
+        "openai" => env_set("OPENAI_API_KEY"),
+        "gemini" => env_set("GEMINI_API_KEY") || env_set("GOOGLE_API_KEY"),
+        _ => false,
+    };
+    if connected {
+        ProviderConnection::Connected
+    } else {
+        ProviderConnection::NeedsKey
+    }
+}
+
+/// Sync connection verdict for a built-in provider — see
+/// [`provider_connection_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderConnection {
+    /// A usable credential is present (API key set, ambient cloud creds, or a
+    /// stored OAuth login). The picker offers it as a live swap.
+    Connected,
+    /// No usable credential — switching would error on the first turn. The
+    /// picker de-emphasises it and routes Enter to the key-add flow instead.
+    NeedsKey,
+}
+
 fn render_provider(active: &str, arg: Option<&str>) -> String {
     use wcore_types::model_aliases::known_providers;
     let known = known_providers();

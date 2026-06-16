@@ -236,9 +236,18 @@ impl Surface for ModelPickerSurface {
                         let active = *provider == app.config.provider.as_str()
                             && (*resolved == app.config.model.as_str()
                                 || *role == app.config.model.as_str());
+                        // Dim models whose provider isn't configured: selecting
+                        // one routes through `apply_provider_swap`, which
+                        // surfaces the graceful "missing API key, run /setup"
+                        // hint rather than switching — the dimming signals that
+                        // up front. The active provider is never dimmed.
+                        let dim = *provider != app.config.provider.as_str()
+                            && super::provider_connection_status(provider)
+                                == super::ProviderConnection::NeedsKey;
                         RowView::Item {
                             selected,
                             active,
+                            dim,
                             label: (*role).to_string(),
                             detail: (*resolved).to_string(),
                         }
@@ -271,36 +280,133 @@ impl Surface for ModelPickerSurface {
 // /provider picker
 // ════════════════════════════════════════════════════════════════════════
 
-/// Arrow-key `/provider` picker overlay. Lists the known providers; the
-/// active one is marked `●`. On Enter emits `/provider <name>`, which the
-/// router live-swaps through `apply_provider_swap` (keeping the OAuth
-/// precheck + live rebind).
+/// One renderable line in the provider picker — a section heading or a
+/// selectable provider row. Only `Provider` rows are selectable.
+enum ProviderRow {
+    /// A section heading (`Connected` / `Not configured`). Not selectable.
+    Heading(&'static str),
+    /// A selectable provider row. `connected` drives the Enter route: a
+    /// connected provider swaps live; a not-configured one routes to the
+    /// key-add flow instead of a failing swap.
+    Provider { name: &'static str, connected: bool },
+}
+
+/// Arrow-key `/provider` picker overlay. Connection-aware: usable providers
+/// (API key set, ambient cloud creds, or a stored OAuth login) are listed
+/// first under "Connected" and the active one is marked `●`; providers missing
+/// a credential are listed under "Not configured", de-emphasised and labelled
+/// "needs an API key". Enter on a connected provider emits `/provider <name>`
+/// (live swap through `apply_provider_swap`, keeping the OAuth precheck);
+/// Enter on a not-configured provider emits `/setup` (the onboarding key-add
+/// flow) rather than a swap that would error for lack of a credential.
 pub struct ProviderPickerSurface {
-    providers: &'static [&'static str],
+    rows: Vec<ProviderRow>,
+    /// Index into `rows` of the highlighted provider. Always points at a
+    /// `Provider` row when one exists; `0` when empty.
     selected: usize,
 }
 
 impl ProviderPickerSurface {
     pub fn new(active_provider: &str) -> Self {
-        let providers = known_providers();
-        let selected = providers
-            .iter()
-            .position(|p| *p == active_provider)
+        let rows = Self::build_rows();
+        let mut surface = Self { rows, selected: 0 };
+        surface.selected = surface
+            .index_of(active_provider)
+            .or_else(|| surface.first_provider_index())
             .unwrap_or(0);
-        Self {
-            providers,
-            selected,
-        }
+        surface
     }
 
+    /// Partition the known providers into Connected / Not-configured sections,
+    /// each preceded by a heading (a heading is emitted only when its section
+    /// is non-empty). Connection status is decided synchronously, no network.
+    fn build_rows() -> Vec<ProviderRow> {
+        let mut connected = Vec::new();
+        let mut needs_key = Vec::new();
+        for name in known_providers() {
+            match super::provider_connection_status(name) {
+                super::ProviderConnection::Connected => connected.push(*name),
+                super::ProviderConnection::NeedsKey => needs_key.push(*name),
+            }
+        }
+        let mut rows = Vec::new();
+        if !connected.is_empty() {
+            rows.push(ProviderRow::Heading("Connected"));
+            for name in connected {
+                rows.push(ProviderRow::Provider {
+                    name,
+                    connected: true,
+                });
+            }
+        }
+        if !needs_key.is_empty() {
+            rows.push(ProviderRow::Heading("Not configured"));
+            for name in needs_key {
+                rows.push(ProviderRow::Provider {
+                    name,
+                    connected: false,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Index of the row for `provider`, if present.
+    fn index_of(&self, provider: &str) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, ProviderRow::Provider { name, .. } if *name == provider))
+    }
+
+    /// Index of the first selectable provider row, if any.
+    fn first_provider_index(&self) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| matches!(r, ProviderRow::Provider { .. }))
+    }
+
+    /// Move the selection to the next provider row, skipping headings.
     fn select_next(&mut self) {
-        if self.selected + 1 < self.providers.len() {
-            self.selected += 1;
+        let mut i = self.selected + 1;
+        while i < self.rows.len() {
+            if matches!(self.rows[i], ProviderRow::Provider { .. }) {
+                self.selected = i;
+                return;
+            }
+            i += 1;
         }
     }
 
+    /// Move the selection to the previous provider row, skipping headings.
     fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let mut i = self.selected;
+        while i > 0 {
+            i -= 1;
+            if matches!(self.rows[i], ProviderRow::Provider { .. }) {
+                self.selected = i;
+                return;
+            }
+        }
+    }
+
+    /// The highlighted provider row, if the selection points at one.
+    fn selected_provider(&self) -> Option<(&'static str, bool)> {
+        match self.rows.get(self.selected) {
+            Some(ProviderRow::Provider { name, connected }) => Some((*name, *connected)),
+            _ => None,
+        }
+    }
+
+    /// Build the `SurfaceAction` for the current selection. A connected
+    /// provider → `/provider <name>` (the live swap). A not-configured
+    /// provider → `/setup` (the onboarding key-add flow) — never a failing
+    /// swap. Nothing selectable → `None`.
+    fn select_action(&self) -> SurfaceAction {
+        match self.selected_provider() {
+            Some((name, true)) => SurfaceAction::Command(format!("/provider {name}")),
+            Some((_, false)) => SurfaceAction::Command("/setup".to_string()),
+            None => SurfaceAction::None,
+        }
     }
 }
 
@@ -312,9 +418,8 @@ impl Surface for ProviderPickerSurface {
     /// Seed the selection to the active provider when the overlay opens.
     fn on_enter(&mut self, app: &mut App) {
         self.selected = self
-            .providers
-            .iter()
-            .position(|p| *p == app.config.provider)
+            .index_of(&app.config.provider)
+            .or_else(|| self.first_provider_index())
             .unwrap_or(0);
     }
 
@@ -339,21 +444,30 @@ impl Surface for ProviderPickerSurface {
             frame,
             list_area,
             theme,
-            self.providers.iter().enumerate().map(|(i, name)| {
+            self.rows.iter().enumerate().map(|(i, row)| {
                 let selected = i == self.selected;
-                let active = *name == app.config.provider.as_str();
-                // Show the sign-in status for OAuth providers (cheap, sync).
-                // `name` is `&&str`; deref-coerces to the `&str` the helper takes.
-                let detail = match super::oauth_provider_signed_in(name) {
-                    Some(true) => "signed in".to_string(),
-                    Some(false) => "not signed in".to_string(),
-                    None => String::new(),
-                };
-                RowView::Item {
-                    selected,
-                    active,
-                    label: (*name).to_string(),
-                    detail,
+                match row {
+                    ProviderRow::Heading(title) => RowView::Heading((*title).to_string()),
+                    ProviderRow::Provider { name, connected } => {
+                        let active = *name == app.config.provider.as_str();
+                        // OAuth providers show their sign-in state; un-configured
+                        // providers explain why they're listed but dimmed.
+                        let detail = if *connected {
+                            match super::oauth_provider_signed_in(name) {
+                                Some(true) => "signed in".to_string(),
+                                _ => String::new(),
+                            }
+                        } else {
+                            "needs an API key".to_string()
+                        };
+                        RowView::Item {
+                            selected,
+                            active,
+                            dim: !*connected,
+                            label: (*name).to_string(),
+                            detail,
+                        }
+                    }
                 }
             }),
             self.selected,
@@ -364,10 +478,7 @@ impl Surface for ProviderPickerSurface {
     fn handle_key(&mut self, key: KeyEvent, _app: &mut App) -> SurfaceAction {
         match key.code {
             KeyCode::Esc => SurfaceAction::CloseOverlay,
-            KeyCode::Enter => match self.providers.get(self.selected) {
-                Some(name) => SurfaceAction::Command(format!("/provider {name}")),
-                None => SurfaceAction::None,
-            },
+            KeyCode::Enter => self.select_action(),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_prev();
                 SurfaceAction::None
@@ -391,6 +502,9 @@ enum RowView {
     Item {
         selected: bool,
         active: bool,
+        /// De-emphasise the row (muted label/marker) — used for providers that
+        /// are listed but not yet usable for lack of a credential.
+        dim: bool,
         label: String,
         detail: String,
     },
@@ -426,11 +540,17 @@ fn render_row(row: &RowView, theme: &Theme) -> Line<'static> {
         RowView::Item {
             selected,
             active,
+            dim,
             label,
             detail,
         } => {
+            // A dimmed (not-configured) row stays selectable — the highlight
+            // still tracks it — but its label/marker render muted so the eye
+            // reads it as "available later", not "ready now".
             let (label_color, detail_color, prefix) = if *selected {
                 (theme.orange, theme.text_dim, "› ")
+            } else if *dim {
+                (theme.text_muted, theme.text_dim, "  ")
             } else {
                 (theme.text, theme.text_muted, "  ")
             };
@@ -611,40 +731,218 @@ mod tests {
         ));
     }
 
-    // ── provider picker ────────────────────────────────────────────────
+    // ── provider picker: connection status ─────────────────────────────
 
-    #[test]
-    fn provider_picker_marks_active_and_selects_it() {
-        let p = ProviderPickerSurface::new("openai");
-        assert_eq!(p.providers[p.selected], "openai");
-    }
-
-    #[test]
-    fn provider_enter_emits_provider_swap_command() {
-        let mut app = App::new();
-        app.config.provider = "anthropic".into();
-        let mut p = ProviderPickerSurface::new("anthropic");
-        // Move down one to a different provider and select it.
-        p.handle_key(key(KeyCode::Down), &mut app);
-        let name = p.providers[p.selected];
-        match p.handle_key(key(KeyCode::Enter), &mut app) {
-            SurfaceAction::Command(line) => assert_eq!(line, format!("/provider {name}")),
-            other => panic!("expected a /provider command, got {other:?}"),
+    /// The connected/not-configured provider names in display order.
+    #[cfg(unix)]
+    fn provider_partition(p: &ProviderPickerSurface) -> (Vec<&'static str>, Vec<&'static str>) {
+        let mut connected = Vec::new();
+        let mut needs_key = Vec::new();
+        for row in &p.rows {
+            if let ProviderRow::Provider {
+                name,
+                connected: ok,
+            } = row
+            {
+                if *ok {
+                    connected.push(*name);
+                } else {
+                    needs_key.push(*name);
+                }
+            }
         }
+        (connected, needs_key)
     }
 
+    /// Run `body` with every built-in provider's API-key env var cleared and a
+    /// fresh tempdir `$HOME` (so no stored OAuth login leaks in). Serialised
+    /// against the other env-mutating tests; restores everything before return.
+    /// `seed_chatgpt_token` writes `$HOME/.wayland/oauth/chatgpt.json` so the
+    /// OAuth provider reads as signed in.
+    #[cfg(unix)]
+    fn with_clean_provider_env<T>(seed_chatgpt_token: bool, body: impl FnOnce() -> T) -> T {
+        const KEYS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "API_KEY",
+        ];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if seed_chatgpt_token {
+            let oauth_dir = tmp.path().join(".wayland").join("oauth");
+            std::fs::create_dir_all(&oauth_dir).expect("mkdir");
+            // A token file present == signed in; a JWT-less access_token is fine
+            // (the plan decode just yields None). Mirrors config.rs's seeder.
+            std::fs::write(
+                oauth_dir.join("chatgpt.json"),
+                r#"{"access_token":"hdr.e30.sig","refresh_token":"r","token_type":"Bearer"}"#,
+            )
+            .expect("write token");
+        }
+        let saved_home = std::env::var_os("HOME");
+        let saved_keys: Vec<(&str, Option<std::ffi::OsString>)> =
+            KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        // SAFETY: serial test; HOME + keys reverted before return.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            for k in KEYS {
+                std::env::remove_var(k);
+            }
+        }
+        let out = body();
+        unsafe {
+            match saved_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            for (k, v) in saved_keys {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn provider_navigation_clamps_at_both_ends() {
-        let mut app = App::new();
-        let mut p = ProviderPickerSurface::new(known_providers()[0]);
-        // Up from index 0 clamps.
-        p.handle_key(key(KeyCode::Up), &mut app);
-        assert_eq!(p.selected, 0);
-        // Down past the end clamps on the last provider.
-        for _ in 0..(p.providers.len() * 2) {
+    #[serial_test::serial]
+    fn provider_rows_partition_into_connected_and_not_configured() {
+        // No API keys, signed in to ChatGPT: the ambient-cloud providers
+        // (bedrock, vertex) and the signed-in OAuth provider are Connected;
+        // the key-only providers (anthropic, openai, gemini) need a key.
+        let (connected, needs_key) =
+            with_clean_provider_env(true, || provider_partition(&ProviderPickerSurface::new("")));
+        assert!(connected.contains(&"bedrock"), "bedrock uses ambient creds");
+        assert!(connected.contains(&"vertex"), "vertex uses ambient creds");
+        assert!(
+            connected.contains(&"openai-chatgpt"),
+            "a stored ChatGPT login is connected"
+        );
+        assert!(needs_key.contains(&"anthropic"), "no ANTHROPIC_API_KEY");
+        assert!(needs_key.contains(&"openai"), "no OPENAI_API_KEY");
+        assert!(needs_key.contains(&"gemini"), "no GEMINI_API_KEY");
+        // bedrock/vertex are NEVER in the not-configured section.
+        assert!(!needs_key.contains(&"bedrock"));
+        assert!(!needs_key.contains(&"vertex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn provider_status_helper_classifies_each_credential_class() {
+        with_clean_provider_env(false, || {
+            // Ambient cloud: always connected, no key needed.
+            assert_eq!(
+                super::super::provider_connection_status("bedrock"),
+                super::super::ProviderConnection::Connected
+            );
+            assert_eq!(
+                super::super::provider_connection_status("vertex"),
+                super::super::ProviderConnection::Connected
+            );
+            // OAuth, no token seeded → needs a login.
+            assert_eq!(
+                super::super::provider_connection_status("openai-chatgpt"),
+                super::super::ProviderConnection::NeedsKey
+            );
+            // API-key, no key set → needs a key.
+            assert_eq!(
+                super::super::provider_connection_status("anthropic"),
+                super::super::ProviderConnection::NeedsKey
+            );
+        });
+        // With a key set, the API-key provider is connected.
+        with_clean_provider_env(false, || {
+            // SAFETY: still inside the serialised env guard.
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test") };
+            assert_eq!(
+                super::super::provider_connection_status("anthropic"),
+                super::super::ProviderConnection::Connected
+            );
+            unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+        });
+    }
+
+    // ── provider picker: Enter routing ─────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn provider_enter_on_connected_emits_swap_command() {
+        // bedrock is always connected (ambient creds) → Enter swaps live.
+        with_clean_provider_env(false, || {
+            let mut app = App::new();
+            let mut p = ProviderPickerSurface::new("bedrock");
+            let (name, connected) = p.selected_provider().expect("a provider selected");
+            assert_eq!(name, "bedrock");
+            assert!(connected);
+            match p.handle_key(key(KeyCode::Enter), &mut app) {
+                SurfaceAction::Command(line) => assert_eq!(line, "/provider bedrock"),
+                other => panic!("expected a /provider command, got {other:?}"),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn provider_enter_on_not_configured_routes_to_setup_not_swap() {
+        // anthropic with no key is not configured → Enter opens the key-add
+        // flow (`/setup`), NEVER a `/provider` swap that would error.
+        with_clean_provider_env(false, || {
+            let mut app = App::new();
+            let mut p = ProviderPickerSurface::new("anthropic");
+            // Point the selection at the anthropic (not-configured) row.
+            let idx = p.index_of("anthropic").expect("anthropic row must exist");
+            p.selected = idx;
+            let (name, connected) = p.selected_provider().expect("a provider selected");
+            assert_eq!(name, "anthropic");
+            assert!(!connected, "anthropic has no key in this env");
+            match p.handle_key(key(KeyCode::Enter), &mut app) {
+                SurfaceAction::Command(line) => assert_eq!(line, "/setup"),
+                other => panic!("expected the /setup route, got {other:?}"),
+            }
+        });
+    }
+
+    // ── provider picker: navigation + active marker ────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn provider_picker_selects_active_provider() {
+        with_clean_provider_env(false, || {
+            // vertex is always connected, so it's always a selectable row.
+            let p = ProviderPickerSurface::new("vertex");
+            let (name, _) = p.selected_provider().expect("a provider selected");
+            assert_eq!(name, "vertex");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn provider_navigation_skips_headings_and_clamps() {
+        with_clean_provider_env(true, || {
+            let mut app = App::new();
+            let mut p = ProviderPickerSurface::new("");
+            // Up to the top clamps on the first provider row (never a heading).
+            for _ in 0..p.rows.len() {
+                p.handle_key(key(KeyCode::Up), &mut app);
+            }
+            assert!(p.selected_provider().is_some());
+            // Down past the end clamps on the last provider row.
+            for _ in 0..(p.rows.len() * 2) {
+                p.handle_key(key(KeyCode::Down), &mut app);
+            }
+            let last = p.selected;
             p.handle_key(key(KeyCode::Down), &mut app);
-        }
-        assert_eq!(p.selected, p.providers.len() - 1);
+            assert_eq!(p.selected, last);
+            assert!(p.selected_provider().is_some());
+        });
     }
 
     #[test]
