@@ -107,6 +107,164 @@ pub fn decode_codex_claims(access_token: &str) -> Result<CodexClaims, String> {
     })
 }
 
+/// Decode the JWT `exp` (expiry) claim, in Unix epoch seconds. Reads the
+/// standard top-level `exp` claim from the payload segment — distinct from
+/// [`decode_codex_claims`], which reads the OpenAI auth-namespace claim.
+/// Returns `None` when the segment is absent / not base64url / not JSON / has
+/// no numeric `exp`.
+fn decode_jwt_exp(token: &str) -> Option<u64> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let seg = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(seg).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("exp").and_then(|x| x.as_u64())
+}
+
+/// Import a ChatGPT login from the Codex CLI's `auth.json`.
+///
+/// Reads `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`), maps the
+/// `tokens` object to [`OAuthTokens`], and derives `expires_at_unix_secs`
+/// from the access-token JWT `exp` claim. The caller persists the result.
+///
+/// C6 hardening — `$CODEX_HOME` is attacker-influenceable, so before trusting
+/// the file we:
+/// - canonicalize (realpath) the path and confirm it stays under the resolved
+///   `$CODEX_HOME` (no symlink escape);
+/// - on Unix, require the file be owned by the current user and NOT
+///   group/world-writable; if `$CODEX_HOME` was set via the environment, the
+///   ownership check is MANDATORY (we never auto-trust an env-pointed file
+///   that fails it);
+/// - run [`decode_codex_claims`] and reject the import if the access token
+///   carries no `chatgpt_account_id`.
+pub fn import_codex_cli_tokens() -> Result<OAuthTokens, String> {
+    let (codex_home, from_env) = codex_home_dir()?;
+    let auth_path = codex_home.join("auth.json");
+
+    // Canonicalize and confirm containment under the resolved CODEX_HOME so a
+    // symlinked auth.json can't redirect the read outside the trusted dir.
+    let real_home = std::fs::canonicalize(&codex_home)
+        .map_err(|e| format!("resolving CODEX_HOME ({}): {e}", codex_home.display()))?;
+    let real_auth = std::fs::canonicalize(&auth_path)
+        .map_err(|e| format!("no Codex CLI login at {} ({e})", auth_path.display()))?;
+    if !real_auth.starts_with(&real_home) {
+        return Err(format!(
+            "Codex auth.json ({}) resolves outside CODEX_HOME ({}) — refusing to import",
+            real_auth.display(),
+            real_home.display()
+        ));
+    }
+
+    // Ownership / permission gate (Unix). Mandatory when CODEX_HOME is
+    // env-supplied; defense-in-depth otherwise.
+    check_codex_auth_perms(&real_auth, from_env)?;
+
+    let bytes = std::fs::read(&real_auth)
+        .map_err(|e| format!("reading {}: {e}", real_auth.display()))?;
+    let doc: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parsing Codex auth.json: {e}"))?;
+
+    let tokens = doc
+        .get("tokens")
+        .ok_or("Codex auth.json has no `tokens` object (is this an API-key login?)")?;
+    let access_token = tokens
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("Codex auth.json has no access_token")?
+        .to_string();
+
+    // Reject a token with no ChatGPT account id — it cannot drive the Codex
+    // backend and would only surface a confusing 4xx later.
+    decode_codex_claims(&access_token)
+        .map_err(|e| format!("Codex access token carries no ChatGPT account id: {e}"))?;
+
+    let refresh_token = tokens
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let id_token = tokens
+        .get("id_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let expires_at_unix_secs = decode_jwt_exp(&access_token);
+
+    Ok(OAuthTokens {
+        access_token,
+        refresh_token,
+        expires_at_unix_secs,
+        token_type: "Bearer".to_string(),
+        scope: None,
+        id_token,
+    })
+}
+
+/// Resolve the Codex home directory. Returns `(dir, from_env)` where
+/// `from_env` is true iff `$CODEX_HOME` was set (which makes the ownership
+/// check mandatory). Default is `~/.codex`.
+fn codex_home_dir() -> Result<(std::path::PathBuf, bool), String> {
+    if let Some(v) = std::env::var_os("CODEX_HOME") {
+        let s = v.to_string_lossy();
+        if !s.trim().is_empty() {
+            return Ok((std::path::PathBuf::from(v), true));
+        }
+    }
+    let home = dirs::home_dir().ok_or("home directory unresolvable")?;
+    Ok((home.join(".codex"), false))
+}
+
+/// Verify the Codex auth.json is safe to trust: owned by the current user and
+/// not group/world-writable. On non-Unix this is a no-op (the profile-dir ACL
+/// covers it). When `mandatory` (env-supplied CODEX_HOME) a failure is an
+/// error; we never auto-trust an env-pointed file that fails the check.
+#[cfg(unix)]
+fn check_codex_auth_perms(path: &std::path::Path, mandatory: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    let mut problems = Vec::new();
+    // SAFETY: getuid is always-succeeds and async-signal-safe; it reads the
+    // calling process's real UID. Declared locally (mirroring wcore-cron's
+    // store) so wcore-agent need not pull in the `libc` crate for one call.
+    let uid = unsafe { codex_getuid() };
+    if meta.uid() != uid {
+        problems.push(format!(
+            "owned by uid {} not the current user ({uid})",
+            meta.uid()
+        ));
+    }
+    // Reject group- or world-writable files (0o022 bits set).
+    if meta.mode() & 0o022 != 0 {
+        problems.push("group/world-writable".to_string());
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    let msg = format!(
+        "Codex auth.json ({}) failed the ownership/permission check: {}",
+        path.display(),
+        problems.join(", ")
+    );
+    if mandatory {
+        Err(msg)
+    } else {
+        // Non-env (default ~/.codex): warn but allow — the home dir is already
+        // user-private. The mandatory gate covers the attacker-controlled case.
+        tracing::warn!("{msg}");
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn check_codex_auth_perms(_path: &std::path::Path, _mandatory: bool) -> Result<(), String> {
+    Ok(())
+}
+
+// Minimal FFI for the running user's real uid. Declared locally (same pattern
+// as `wcore-cron::store`) so wcore-agent keeps its dependency surface small.
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "getuid"]
+    fn codex_getuid() -> u32;
+}
+
 /// Owns load / refresh / persist of the ChatGPT Codex OAuth tokens plus the
 /// access-token JWT decode. Built by bootstrap; the async bearer closure
 /// handed to the provider calls [`ChatGptTokenManager::get`].
@@ -595,5 +753,115 @@ mod tests {
         )
         .with_redirect_strategy(RedirectStrategy::FixedPort(CALLBACK_PORT))
         .with_redirect_uri_parts(CALLBACK_HOST, CALLBACK_PATH)
+    }
+
+    // ── Task 5.3: Codex CLI token import (C6 hardening) ──────────────
+
+    /// A 3-segment JWT carrying both the ChatGPT account-id namespace claim
+    /// and a top-level `exp`, so the import path can derive expiry from it.
+    fn jwt_with_account_and_exp(account_id: &str, exp: u64) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let payload = serde_json::json!({
+            "exp": exp,
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id }
+        });
+        let seg = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        format!("hdr.{seg}.sig")
+    }
+
+    /// Write a fake `$CODEX_HOME/auth.json` carrying the Codex CLI's `tokens`
+    /// shape and return the CODEX_HOME dir.
+    fn write_codex_auth(home: &std::path::Path, body: serde_json::Value) {
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn imports_codex_tokens_with_account_id() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("codex");
+        let exp = far_future();
+        let access = jwt_with_account_and_exp("acct_codex", exp);
+        write_codex_auth(
+            &home,
+            serde_json::json!({
+                "OPENAI_API_KEY": serde_json::Value::Null,
+                "tokens": {
+                    "access_token": access,
+                    "refresh_token": "rt-codex",
+                    "id_token": "id-codex",
+                }
+            }),
+        );
+
+        // SAFETY: serial test; env reverted before exit.
+        let saved = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", &home) };
+        let result = import_codex_cli_tokens();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("CODEX_HOME", v) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        let tokens = result.expect("import");
+        assert_eq!(tokens.access_token, access);
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt-codex"));
+        assert_eq!(tokens.id_token.as_deref(), Some("id-codex"));
+        assert_eq!(tokens.expires_at_unix_secs, Some(exp));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rejects_codex_token_without_account_id() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("codex");
+        // access_token payload {"foo":"bar"} — no chatgpt_account_id.
+        let bad = format!("hdr.{}.sig", URL_SAFE_NO_PAD.encode(b"{\"foo\":\"bar\"}"));
+        write_codex_auth(
+            &home,
+            serde_json::json!({ "tokens": { "access_token": bad } }),
+        );
+
+        let saved = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", &home) };
+        let result = import_codex_cli_tokens();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("CODEX_HOME", v) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        let err = result.unwrap_err();
+        assert!(err.contains("account id"), "err={err}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn errors_when_codex_auth_missing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("codex");
+        std::fs::create_dir_all(&home).unwrap(); // dir exists, file does not
+
+        let saved = std::env::var_os("CODEX_HOME");
+        unsafe { std::env::set_var("CODEX_HOME", &home) };
+        let result = import_codex_cli_tokens();
+        match saved {
+            Some(v) => unsafe { std::env::set_var("CODEX_HOME", v) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_jwt_exp_reads_top_level_exp() {
+        let jwt = jwt_with_account_and_exp("acct_x", 1_900_000_000);
+        assert_eq!(decode_jwt_exp(&jwt), Some(1_900_000_000));
+        assert_eq!(decode_jwt_exp("not-a-jwt"), None);
     }
 }
