@@ -287,6 +287,25 @@ impl ChatGptTokenManager {
         }
     }
 
+    /// Construct a manager whose OAuth flow descriptor is supplied explicitly.
+    ///
+    /// Production code uses [`ChatGptTokenManager::new`], which hardwires the
+    /// real `auth.openai.com` token endpoint via [`build_chatgpt_flow`]. This
+    /// seam lets out-of-crate integration tests point the refresh round-trip at
+    /// a local mock token server (the in-crate unit tests reach the private
+    /// `flow` field directly; an external `tests/` binary cannot, hence this
+    /// hidden constructor).
+    #[doc(hidden)]
+    pub fn new_with_flow(storage: OAuthStorage, flow: OAuthFlow) -> Self {
+        Self {
+            flow: Arc::new(flow),
+            single_flight: Arc::new(SingleFlightRefresh::new()),
+            client: wcore_egress::EgressClient::tool(),
+            storage,
+            cached: Mutex::new(None),
+        }
+    }
+
     /// Whether the token is valid for at least `REFRESH_LEAD_SECS` more
     /// seconds. ChatGPT always sets `expires_in`, so a MISSING expiry is
     /// treated as stale (forces a refresh) rather than fresh.
