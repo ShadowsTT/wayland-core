@@ -355,6 +355,123 @@ fn env_set_nonempty(name: &str) -> bool {
     matches!(std::env::var(name), Ok(v) if !v.is_empty())
 }
 
+/// S8: build the **config-posture** health rows from the resolved
+/// [`ConfigView`](crate::tui::app::ConfigView) snapshot on `App`.
+///
+/// These are coherence/safety checks on the user's *configuration* — distinct
+/// from the SYSTEM (binaries), PROVIDERS (live HTTP), and TOOLS (env gates)
+/// sections, which probe the runtime environment. Every row reads real config
+/// values plumbed by S5–S7 (egress allowlist, credential backend, spend cap,
+/// failover chain, tool-approval posture) plus one cheap filesystem resolve
+/// for the memory directory. A valid-but-permissive state is surfaced as
+/// `Warn` (never a fake `Fail`); a benign "off" state is an honest `Ok`.
+fn scan_config_health(app: &App) -> Vec<HealthCheck> {
+    let c = &app.config;
+    let mut rows = Vec::new();
+
+    // Egress guard — off means outbound calls are not gated.
+    rows.push(if c.security_egress_enabled {
+        let n = c.egress_allow.len();
+        HealthCheck::new(
+            "egress guard",
+            HealthState::Ok,
+            format!(
+                "on · {n} extra allowlist entr{}",
+                if n == 1 { "y" } else { "ies" }
+            ),
+        )
+    } else {
+        HealthCheck::new(
+            "egress guard",
+            HealthState::Warn,
+            "off — outbound network calls are not restricted",
+        )
+    });
+
+    // Credential storage backend — plaintext is the permissive default.
+    rows.push(match c.storage_backend.as_str() {
+        "keyring" => HealthCheck::new("credential store", HealthState::Ok, "OS keyring"),
+        "encrypted-file" => HealthCheck::new("credential store", HealthState::Ok, "encrypted file"),
+        _ => HealthCheck::new(
+            "credential store",
+            HealthState::Warn,
+            "plaintext file (0600) — Advanced → keyring to harden",
+        ),
+    });
+
+    // Tool approval posture — auto-approve runs every tool call unprompted.
+    rows.push(if c.tools_auto_approve {
+        HealthCheck::new(
+            "tool approval",
+            HealthState::Warn,
+            "auto-approve — every tool call runs without a prompt",
+        )
+    } else {
+        HealthCheck::new(
+            "tool approval",
+            HealthState::Ok,
+            format!("ask each · {} pre-approved", c.tools_allow_list.len()),
+        )
+    });
+
+    // Provider failover chain (S7) — on with no chain does nothing.
+    rows.push(if c.failover_enabled {
+        if c.fallback_models.is_empty() {
+            HealthCheck::new(
+                "provider failover",
+                HealthState::Warn,
+                "on but no fallback models configured",
+            )
+        } else {
+            let n = c.fallback_models.len();
+            HealthCheck::new(
+                "provider failover",
+                HealthState::Ok,
+                format!("on · {n} fallback model{}", if n == 1 { "" } else { "s" }),
+            )
+        }
+    } else {
+        HealthCheck::new(
+            "provider failover",
+            HealthState::Ok,
+            "off — single provider",
+        )
+    });
+
+    // Spend cap (S5) — informational; "no cap" is a valid choice.
+    rows.push(match c.budget_max_cost_usd {
+        Some(cap) => HealthCheck::new(
+            "spend cap",
+            HealthState::Ok,
+            format!("${cap:.2} per session"),
+        ),
+        None => HealthCheck::new("spend cap", HealthState::Ok, "no cap set"),
+    });
+
+    // Long-term memory — when on, the store directory must resolve.
+    rows.push(if c.memory_enabled {
+        match std::env::current_dir()
+            .ok()
+            .and_then(|cwd| wcore_memory::paths::auto_memory_dir(&cwd))
+        {
+            Some(dir) => HealthCheck::new(
+                "long-term memory",
+                HealthState::Ok,
+                format!("on · {}", dir.display()),
+            ),
+            None => HealthCheck::new(
+                "long-term memory",
+                HealthState::Warn,
+                "on · could not resolve the memory directory",
+            ),
+        }
+    } else {
+        HealthCheck::new("long-term memory", HealthState::Ok, "off")
+    });
+
+    rows
+}
+
 /// Extract the last 10 engine errors from the session transcript.
 /// The protocol bridge pushes each `ProtocolEvent::Error` as a
 /// `TurnRole::System` turn whose first markdown element starts with
@@ -529,6 +646,10 @@ pub struct DiagnosticsSurface {
     /// `TOOL_GATES` + a live env-var probe. Cheap to recompute, but
     /// caching it keeps the render path free of `std::env::var` calls.
     tool_status: Vec<ToolStatusRow>,
+    /// S8 — config-posture health rows built from the resolved `ConfigView`
+    /// on `App` (egress / credentials / tool approval / failover / spend cap /
+    /// memory). Refreshed alongside the doctor probe on `on_enter` + `r`.
+    config_checks: Vec<HealthCheck>,
 }
 
 impl Default for DiagnosticsSurface {
@@ -552,6 +673,7 @@ impl DiagnosticsSurface {
             doctor_collected: false,
             provider_health: Vec::new(),
             tool_status: Vec::new(),
+            config_checks: Vec::new(),
         }
     }
 
@@ -563,10 +685,11 @@ impl DiagnosticsSurface {
     /// Run the live `doctor` probe and store its report. Also refreshes
     /// the v0.9.0 W4 E2 provider-health probes (real HTTP) + the cheap
     /// env-driven tool-status snapshot.
-    fn refresh_doctor(&mut self) {
+    fn refresh_doctor(&mut self, app: &App) {
         self.doctor = run_doctor();
         self.provider_health = run_provider_health();
         self.tool_status = scan_tool_status();
+        self.config_checks = scan_config_health(app);
         self.doctor_collected = true;
     }
 
@@ -688,8 +811,8 @@ impl Surface for DiagnosticsSurface {
 
     /// Refresh both the doctor probe and the memory scan when the surface
     /// becomes active, so re-entering the screen always shows live data.
-    fn on_enter(&mut self, _app: &mut App) {
-        self.refresh_doctor();
+    fn on_enter(&mut self, app: &mut App) {
+        self.refresh_doctor(app);
         self.refresh_memory();
     }
 
@@ -753,7 +876,7 @@ impl Surface for DiagnosticsSurface {
             }
             // `/doctor` re-run — re-run the live probe in place.
             KeyCode::Char('r') if self.mode == DiagMode::Doctor => {
-                self.refresh_doctor();
+                self.refresh_doctor(app);
                 SurfaceAction::None
             }
             // `/memory` list navigation.
@@ -853,7 +976,7 @@ impl DiagnosticsSurface {
     ///   5. Token budget for the active model
     fn render_doctor(&self, frame: &mut Frame, area: Rect, app: &App, t: &Theme) {
         let block = panel(
-            " /doctor — system · providers · tools · errors · tokens ",
+            " /doctor — system · providers · config · tools · errors · tokens ",
             t,
         );
         let inner = block.inner(area);
@@ -896,7 +1019,17 @@ impl DiagnosticsSurface {
             }
         }
 
-        // ── 3. Per-tool backend status ──────────────────────────────
+        // ── 3. Config posture rows (S8) ─────────────────────────────
+        // Coherence/safety checks on the resolved config snapshot — the
+        // answer to "is my configuration sane", distinct from the runtime
+        // probes above.
+        lines.push(Line::from(""));
+        push_section_header(&mut lines, t, "CONFIG");
+        for check in &self.config_checks {
+            lines.push(status_row(check.state, &check.label, &check.detail, t));
+        }
+
+        // ── 4. Per-tool backend status ──────────────────────────────
         lines.push(Line::from(""));
         push_section_header(&mut lines, t, "TOOLS");
         for row in &self.tool_status {
@@ -913,7 +1046,7 @@ impl DiagnosticsSurface {
             lines.push(status_row(state, &row.name, &detail, t));
         }
 
-        // ── 4. MCP servers ──────────────────────────────────────────
+        // ── 5. MCP servers ──────────────────────────────────────────
         // Seeded at boot from the connect-health snapshot (tui::run) and
         // updated live by McpReady / McpFailed events. A failed or timed-out
         // server is the answer to "why aren't my plugin's tools showing up".
@@ -946,7 +1079,7 @@ impl DiagnosticsSurface {
             }
         }
 
-        // ── 5. Recent engine errors ─────────────────────────────────
+        // ── 6. Recent engine errors ─────────────────────────────────
         lines.push(Line::from(""));
         push_section_header(&mut lines, t, "RECENT ERRORS");
         let errors = collect_recent_errors(app);
@@ -967,7 +1100,7 @@ impl DiagnosticsSurface {
             }
         }
 
-        // ── 6. Token budget ─────────────────────────────────────────
+        // ── 7. Token budget ─────────────────────────────────────────
         lines.push(Line::from(""));
         push_section_header(&mut lines, t, "TOKEN BUDGET");
         let budget = token_budget_view(app);
@@ -1865,6 +1998,92 @@ mod tests {
         assert!(
             out.contains("none configured"),
             "empty state missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn doctor_shows_config_section_with_posture_rows() {
+        // S8: the CONFIG section surfaces config-posture health. A permissive
+        // config flags Warn rows the user can act on.
+        let mut s = DiagnosticsSurface::new();
+        let mut app = App::new();
+        app.config.security_egress_enabled = false; // unrestricted egress
+        app.config.tools_auto_approve = true; // every tool unprompted
+        app.config.storage_backend = "plaintext".into();
+        app.config.failover_enabled = true;
+        app.config.fallback_models = Vec::new(); // on but empty
+        s.on_enter(&mut app);
+        let out = render_tall(&mut s, &app);
+        assert!(
+            out.contains("CONFIG"),
+            "CONFIG section header missing:\n{out}"
+        );
+        assert!(out.contains("egress guard"), "egress row missing:\n{out}");
+        assert!(
+            out.contains("credential store"),
+            "creds row missing:\n{out}"
+        );
+        assert!(
+            out.contains("tool approval"),
+            "tool-approval row missing:\n{out}"
+        );
+        assert!(
+            out.contains("provider failover"),
+            "failover row missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_health_flags_permissive_posture_as_warn() {
+        // The risky-but-valid states must be Warn (actionable), never a fake
+        // Fail and never a silent Ok.
+        let mut app = App::new();
+        app.config.security_egress_enabled = false;
+        app.config.tools_auto_approve = true;
+        app.config.storage_backend = "plaintext".into();
+        app.config.failover_enabled = true;
+        app.config.fallback_models = Vec::new();
+        let rows = scan_config_health(&app);
+        let warn = |label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("missing row {label}"))
+                .state
+        };
+        assert_eq!(warn("egress guard"), HealthState::Warn);
+        assert_eq!(warn("tool approval"), HealthState::Warn);
+        assert_eq!(warn("credential store"), HealthState::Warn);
+        assert_eq!(warn("provider failover"), HealthState::Warn);
+    }
+
+    #[test]
+    fn config_health_marks_hardened_posture_ok() {
+        // A locked-down config reads clean: guard on, keyring, ask-each,
+        // failover with a chain, a spend cap.
+        let mut app = App::new();
+        app.config.security_egress_enabled = true;
+        app.config.egress_allow = vec!["example.com".into()];
+        app.config.tools_auto_approve = false;
+        app.config.tools_allow_list = vec!["Read".into(), "Grep".into()];
+        app.config.storage_backend = "keyring".into();
+        app.config.failover_enabled = true;
+        app.config.fallback_models = vec!["anthropic:haiku".into()];
+        app.config.budget_max_cost_usd = Some(5.0);
+        let rows = scan_config_health(&app);
+        assert!(
+            rows.iter().all(|r| r.state == HealthState::Ok),
+            "a hardened config must have no warnings, got: {:?}",
+            rows.iter()
+                .filter(|r| r.state != HealthState::Ok)
+                .map(|r| (&r.label, &r.detail))
+                .collect::<Vec<_>>()
+        );
+        // The egress row should report the allowlist count.
+        let egress = rows.iter().find(|r| r.label == "egress guard").unwrap();
+        assert!(
+            egress.detail.contains('1'),
+            "egress detail should count the allowlist entry: {}",
+            egress.detail
         );
     }
 
