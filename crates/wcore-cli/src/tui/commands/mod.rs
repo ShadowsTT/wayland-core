@@ -228,6 +228,12 @@ impl CommandRegistry {
                 "tokens and spend this session",
                 false,
             ),
+            Command::new(
+                "/effective",
+                ContextMemory,
+                "view the resolved config (redacted)",
+                false,
+            ),
             // TOOLS & EXTENSIONS
             Command::new(
                 "/tools",
@@ -567,7 +573,8 @@ mod tests {
         // mirrors the Ctrl+Space chord through the same dispatcher).
         // `/theme` is the 27th — light/dark/auto switch (v0.9.2 W8, §5).
         // `/connect` is the 28th — S4b paste-to-detect provider connect.
-        assert_eq!(reg.len(), 28);
+        // `/effective` is the 29th — S9 redacted effective-config preview.
+        assert_eq!(reg.len(), 29);
         for name in [
             "/resume",
             "/rewind",
@@ -581,6 +588,7 @@ mod tests {
             "/repomap",
             "/memory",
             "/cost",
+            "/effective",
             "/tools",
             "/mcp",
             "/auth",

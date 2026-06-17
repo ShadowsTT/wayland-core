@@ -585,7 +585,7 @@ pub struct MemoryReport {
 // DiagnosticsSurface
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Which of the three diagnostic screens is in view.
+/// Which diagnostic screen is in view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagMode {
     /// `/doctor` — provider / key / MCP health.
@@ -594,11 +594,18 @@ pub enum DiagMode {
     Cost,
     /// `/memory` — long-term memory contents + delete.
     Memory,
+    /// `/effective` — the resolved effective config, redacted (S9).
+    Effective,
 }
 
 impl DiagMode {
-    /// The three modes in tab order.
-    const ALL: [DiagMode; 3] = [DiagMode::Doctor, DiagMode::Cost, DiagMode::Memory];
+    /// The modes in tab order.
+    const ALL: [DiagMode; 4] = [
+        DiagMode::Doctor,
+        DiagMode::Cost,
+        DiagMode::Memory,
+        DiagMode::Effective,
+    ];
 
     /// The slash-command label for this mode.
     fn label(self) -> &'static str {
@@ -606,6 +613,7 @@ impl DiagMode {
             DiagMode::Doctor => "/doctor",
             DiagMode::Cost => "/cost",
             DiagMode::Memory => "/memory",
+            DiagMode::Effective => "/effective",
         }
     }
 }
@@ -650,6 +658,13 @@ pub struct DiagnosticsSurface {
     /// on `App` (egress / credentials / tool approval / failover / spend cap /
     /// memory). Refreshed alongside the doctor probe on `on_enter` + `r`.
     config_checks: Vec<HealthCheck>,
+    /// S9 — the rendered effective-config TOML (redacted) for the `/effective`
+    /// mode, built on `on_enter` via `wcore_config::config::effective_config_toml`.
+    /// Holds an error message string if the render failed.
+    effective_toml: String,
+    /// Vertical scroll offset for the `/effective` view (the TOML can exceed
+    /// the viewport). Clamped on `Up`/`Down`/`PageUp`/`PageDown`.
+    effective_scroll: u16,
 }
 
 impl Default for DiagnosticsSurface {
@@ -674,6 +689,8 @@ impl DiagnosticsSurface {
             provider_health: Vec::new(),
             tool_status: Vec::new(),
             config_checks: Vec::new(),
+            effective_toml: String::new(),
+            effective_scroll: 0,
         }
     }
 
@@ -691,6 +708,20 @@ impl DiagnosticsSurface {
         self.tool_status = scan_tool_status();
         self.config_checks = scan_config_health(app);
         self.doctor_collected = true;
+    }
+
+    /// S9: render the redacted effective config into `effective_toml` and reset
+    /// the scroll. Uses default CLI args — the file-merged config (global ←
+    /// project ← profile is not threaded yet; a follow-up). A render failure is
+    /// stored as a readable message rather than panicking the read-only screen.
+    fn refresh_effective(&mut self) {
+        self.effective_toml = match wcore_config::config::effective_config_toml(
+            &wcore_config::config::CliArgs::default(),
+        ) {
+            Ok(toml) => toml,
+            Err(e) => format!("could not render the effective config:\n{e:#}"),
+        };
+        self.effective_scroll = 0;
     }
 
     /// Re-scan the project long-term memory directory into the `/memory`
@@ -814,6 +845,7 @@ impl Surface for DiagnosticsSurface {
     fn on_enter(&mut self, app: &mut App) {
         self.refresh_doctor(app);
         self.refresh_memory();
+        self.refresh_effective();
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -831,6 +863,7 @@ impl Surface for DiagnosticsSurface {
             DiagMode::Doctor => self.render_doctor(frame, body_area, app, theme),
             DiagMode::Cost => self.render_cost(frame, body_area, app, theme),
             DiagMode::Memory => self.render_memory(frame, body_area, theme),
+            DiagMode::Effective => self.render_effective(frame, body_area, theme),
         }
     }
 
@@ -855,6 +888,27 @@ impl Surface for DiagnosticsSurface {
             }
             KeyCode::Char('3') => {
                 self.mode = DiagMode::Memory;
+                SurfaceAction::None
+            }
+            KeyCode::Char('4') => {
+                self.mode = DiagMode::Effective;
+                SurfaceAction::None
+            }
+            // `/effective` scroll — the redacted TOML can exceed the viewport.
+            KeyCode::Up | KeyCode::Char('k') if self.mode == DiagMode::Effective => {
+                self.effective_scroll = self.effective_scroll.saturating_sub(1);
+                SurfaceAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.mode == DiagMode::Effective => {
+                self.effective_scroll = self.effective_scroll.saturating_add(1);
+                SurfaceAction::None
+            }
+            KeyCode::PageUp if self.mode == DiagMode::Effective => {
+                self.effective_scroll = self.effective_scroll.saturating_sub(10);
+                SurfaceAction::None
+            }
+            KeyCode::PageDown if self.mode == DiagMode::Effective => {
+                self.effective_scroll = self.effective_scroll.saturating_add(10);
                 SurfaceAction::None
             }
             KeyCode::Tab => {
@@ -1311,6 +1365,56 @@ impl DiagnosticsSurface {
         let para = Paragraph::new(lines).style(Style::default().bg(t.surface));
         frame.render_widget(para, inner);
     }
+
+    /// Render the `/effective` screen (S9): the redacted, merged effective
+    /// config as scrollable TOML, with a header noting what is and isn't shown.
+    fn render_effective(&self, frame: &mut Frame, area: Rect, t: &Theme) {
+        let block = panel(" /effective — resolved config · redacted ", t);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let [note_area, body_area, footer_area] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Merged from global ← project config files. Secrets shown as ***.",
+                    Style::default().fg(t.text_dim),
+                )),
+                Line::from(Span::styled(
+                    "Live env-resolved API keys and session CLI flags are not shown.",
+                    Style::default().fg(t.text_muted),
+                )),
+            ]),
+            note_area,
+        );
+
+        // Clamp the scroll so the view can never run past the end into a blank
+        // screen (the held offset may exceed the content; the display clamps).
+        let total_lines = self.effective_toml.lines().count() as u16;
+        let scroll = self.effective_scroll.min(total_lines.saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(self.effective_toml.clone())
+                .style(Style::default().fg(t.text))
+                .scroll((scroll, 0)),
+            body_area,
+        );
+
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  ↑↓ scroll · 1 doctor · 2 cost · 3 memory · 4 effective · esc workspace",
+                Style::default().fg(t.text_muted),
+            ))),
+            footer_area,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1414,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_through_the_three_modes() {
+    fn tab_cycles_through_the_modes() {
         let mut s = DiagnosticsSurface::new();
         let mut app = App::new();
         s.handle_key(key(KeyCode::Tab), &mut app);
@@ -1422,10 +1526,39 @@ mod tests {
         s.handle_key(key(KeyCode::Tab), &mut app);
         assert_eq!(s.mode(), DiagMode::Memory);
         s.handle_key(key(KeyCode::Tab), &mut app);
+        assert_eq!(s.mode(), DiagMode::Effective);
+        s.handle_key(key(KeyCode::Tab), &mut app);
         // Wraps back to the first mode.
         assert_eq!(s.mode(), DiagMode::Doctor);
         s.handle_key(key(KeyCode::BackTab), &mut app);
-        assert_eq!(s.mode(), DiagMode::Memory);
+        assert_eq!(s.mode(), DiagMode::Effective);
+    }
+
+    #[test]
+    fn effective_mode_renders_redaction_note_and_scrolls() {
+        // S9: the `4` key selects the Effective tab; the redacted-config
+        // preview renders with its caveat header and the scroll keys move the
+        // offset. The redaction note is static UI text, so this assertion is
+        // hermetic regardless of the box's real config contents.
+        let mut s = DiagnosticsSurface::new();
+        let mut app = App::new();
+        s.on_enter(&mut app);
+        s.handle_key(key(KeyCode::Char('4')), &mut app);
+        assert_eq!(s.mode(), DiagMode::Effective);
+        let out = render_to_string(&mut s);
+        assert!(out.contains("/effective"), "tab label missing:\n{out}");
+        assert!(
+            out.contains("Secrets shown as"),
+            "redaction note missing:\n{out}"
+        );
+        // Scroll down then up returns to the start; saturating at 0.
+        let before = s.effective_scroll;
+        s.handle_key(key(KeyCode::Down), &mut app);
+        assert_eq!(s.effective_scroll, before + 1);
+        s.handle_key(key(KeyCode::Up), &mut app);
+        assert_eq!(s.effective_scroll, before);
+        s.handle_key(key(KeyCode::Up), &mut app);
+        assert_eq!(s.effective_scroll, 0, "scroll must saturate at the top");
     }
 
     // -- /doctor screen ----------------------------------------------------

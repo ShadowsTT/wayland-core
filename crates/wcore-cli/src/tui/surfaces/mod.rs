@@ -1720,12 +1720,14 @@ impl Router {
                                 self.apply(SurfaceAction::OpenOverlay(SurfaceId::Marketplace), app);
                         }
                     }
-                    "/doctor" | "/memory" | "/tools" => {
+                    "/doctor" | "/memory" | "/tools" | "/effective" => {
                         // `/tools` was a stub forwarded to the LLM. The
                         // diagnostics surface already enumerates every
                         // host-known tool with its backend/enabled status —
                         // route there rather than build a second, divergent
                         // tool list (Krug: one place to see what's loaded).
+                        // `/effective` (S9) lands on the same surface; its
+                        // redacted-config tab is reachable via `4`/Tab.
                         self.switch(app, SurfaceId::Diagnostics);
                     }
                     "/cost" => {
