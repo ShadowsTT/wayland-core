@@ -1253,7 +1253,7 @@ impl Router {
                         // so the next `/config` on_enter reseeds from the just-
                         // saved truth, same as the five settings above.
                         app.config.tools_auto_approve = applied.config_view.tools_auto_approve;
-                        app.config.tools_allow_count = applied.config_view.tools_allow_count;
+                        app.config.tools_allow_list = applied.config_view.tools_allow_list.clone();
                         app.config.tools_verify_edits = applied.config_view.tools_verify_edits;
                         app.config.budget_max_cost_usd = applied.config_view.budget_max_cost_usd;
                         app.config.budget_max_wall_secs = applied.config_view.budget_max_wall_secs;
@@ -1266,6 +1266,11 @@ impl Router {
                         app.config.storage_backend = applied.config_view.storage_backend.clone();
                         app.config.security_egress_enabled =
                             applied.config_view.security_egress_enabled;
+                        // S7 collection editors: mirror the egress allowlist and
+                        // the failover chain so the next on_enter reseeds truth.
+                        app.config.egress_allow = applied.config_view.egress_allow.clone();
+                        app.config.failover_enabled = applied.config_view.failover_enabled;
+                        app.config.fallback_models = applied.config_view.fallback_models.clone();
                         // The live apply succeeded — clear any prior degraded
                         // flag so `/config` shows the honest "now live" copy.
                         app.config_apply_failed = false;

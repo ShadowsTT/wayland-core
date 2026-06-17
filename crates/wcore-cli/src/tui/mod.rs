@@ -243,7 +243,7 @@ pub fn config_view_from(config: &wcore_config::config::Config) -> app::ConfigVie
         // S5 Essentials: tools posture + budget cap, read straight from the
         // resolved config so the home shows the live values.
         tools_auto_approve: config.tools.auto_approve,
-        tools_allow_count: config.tools.allow_list.len(),
+        tools_allow_list: config.tools.allow_list.clone(),
         tools_verify_edits: config.tools.verify_edits,
         budget_max_cost_usd: config.budget.max_cost_usd,
         budget_max_wall_secs: config.budget.max_wall_time_secs,
@@ -258,6 +258,11 @@ pub fn config_view_from(config: &wcore_config::config::Config) -> app::ConfigVie
         }
         .to_string(),
         security_egress_enabled: config.security.enabled,
+        // S7 collection editors: the egress allowlist and the provider
+        // failover chain, read straight from the resolved config.
+        egress_allow: config.security.egress_allow.clone(),
+        failover_enabled: config.provider_chain.enabled,
+        fallback_models: config.provider_chain.fallback_models.clone(),
     }
 }
 

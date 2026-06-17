@@ -1231,10 +1231,10 @@ pub struct ConfigView {
     /// `[tools] auto_approve` — every tool call is auto-approved without a
     /// per-call prompt. Surfaced by the Essentials Tools row.
     pub tools_auto_approve: bool,
-    /// Number of entries in `[tools] allow_list` (the pre-approved tools).
-    /// Carried as a count (not the Vec) because the Essentials row shows
-    /// "N allowed"; the full editor is an Advanced/collection slice.
-    pub tools_allow_count: usize,
+    /// `[tools] allow_list` — the pre-approved tools. The Essentials Tools
+    /// row shows the count (`.len()`); the Advanced list editor (S7) edits the
+    /// entries directly.
+    pub tools_allow_list: Vec<String>,
     /// `[tools] verify_edits` — re-read files after Write/Edit and feed a
     /// verification-failed note back into the next turn.
     pub tools_verify_edits: bool,
@@ -1257,9 +1257,18 @@ pub struct ConfigView {
     /// keyring; `encrypted-file` (two configured paths) is shown read-only so
     /// the radio never clobbers the path layout.
     pub storage_backend: String,
-    /// `[security] enabled` — the egress network guard. Advanced-tier toggle
-    /// (the `egress_allow` list editor is a later collection slice).
+    /// `[security] enabled` — the egress network guard. Advanced-tier toggle.
     pub security_egress_enabled: bool,
+    /// `[security] egress_allow` — operator-curated extra egress allowlist
+    /// entries. The Advanced list editor (S7) adds/edits/removes domains.
+    pub egress_allow: Vec<String>,
+    /// `[provider_chain] enabled` — wrap the primary provider in the resilient
+    /// circuit-breaker + fallback chain. Advanced-tier toggle (S7).
+    pub failover_enabled: bool,
+    /// `[provider_chain] fallback_models` — ordered fallback model ids tried
+    /// when the primary's circuit opens. The Advanced list editor (S7) edits
+    /// the chain.
+    pub fallback_models: Vec<String>,
 }
 
 /// The four `ProviderCompat` cost-per-token overrides surfaced by the

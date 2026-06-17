@@ -215,9 +215,9 @@ struct SettingsModel {
     /// `auto_approve` — approve every tool call without a per-call prompt.
     /// The Tools row's editable toggle.
     tools_auto_approve: bool,
-    /// Count of pre-approved tools (`allow_list` length). Read-out only on
-    /// the Tools row; the full list editor is a later collection slice.
-    tools_allow_count: usize,
+    /// Pre-approved tools (`allow_list`). The Tools row shows the count; the
+    /// Advanced list editor (S7) edits the entries.
+    tools_allow_list: Vec<String>,
     /// `verify_edits` — re-read files after writes. Read-out on the Tools row.
     tools_verify_edits: bool,
     // SPENDING (`[budget]`) -----------------------------------------------
@@ -240,6 +240,13 @@ struct SettingsModel {
     storage_backend: String,
     /// `[security] enabled` — the egress network guard.
     security_egress_enabled: bool,
+    // COLLECTIONS (`[security]`/`[provider_chain]`) — S7 list editors --------
+    /// `[security] egress_allow` — extra egress allowlist entries.
+    egress_allow: Vec<String>,
+    /// `[provider_chain] enabled` — wrap the primary in the resilient chain.
+    failover_enabled: bool,
+    /// `[provider_chain] fallback_models` — the ordered failover chain.
+    fallback_models: Vec<String>,
     // EXPERT (provider tuning) --------------------------------------------
     /// The four editable `ProviderCompat` cost-per-token overrides for the
     /// active provider (Expert tier). Each `None` = "no override set".
@@ -274,7 +281,7 @@ impl SettingsModel {
             compaction: Compaction::from_view_str(&cv.compaction),
             long_term_memory: cv.memory_enabled,
             tools_auto_approve: cv.tools_auto_approve,
-            tools_allow_count: cv.tools_allow_count,
+            tools_allow_list: cv.tools_allow_list.clone(),
             tools_verify_edits: cv.tools_verify_edits,
             budget_max_cost_usd: cv.budget_max_cost_usd,
             budget_max_wall_secs: cv.budget_max_wall_secs,
@@ -289,6 +296,9 @@ impl SettingsModel {
                 cv.storage_backend.clone()
             },
             security_egress_enabled: cv.security_egress_enabled,
+            egress_allow: cv.egress_allow.clone(),
+            failover_enabled: cv.failover_enabled,
+            fallback_models: cv.fallback_models.clone(),
             compat_costs: cv.compat_costs,
         }
     }
@@ -381,17 +391,61 @@ enum AdvField {
     WorkflowLive,
     CredentialBackend,
     EgressGuard,
+    /// SECURITY · the `egress_allow` list editor (S7).
+    EgressAllowlist,
+    /// TOOLS · the `allow_list` (pre-approved tools) list editor (S7).
+    ToolAllowList,
+    /// FAILOVER · `provider_chain.enabled` toggle (S7).
+    FailoverEnabled,
+    /// FAILOVER · the `fallback_models` chain list editor (S7).
+    FallbackChain,
     ProviderCosts,
+}
+
+/// Which `Vec<String>` config collection the list editor (Tier `ListEdit`) is
+/// editing. Each maps to one `SettingsModel` buffer and one persisted field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListKind {
+    /// `[tools] allow_list` — pre-approved tools.
+    ToolsAllow,
+    /// `[security] egress_allow` — extra egress allowlist entries.
+    EgressAllow,
+    /// `[provider_chain] fallback_models` — the failover chain.
+    FallbackModels,
+}
+
+impl ListKind {
+    /// The panel title shown while editing this collection.
+    fn title(self) -> &'static str {
+        match self {
+            ListKind::ToolsAllow => "Pre-approved tools",
+            ListKind::EgressAllow => "Egress allowlist",
+            ListKind::FallbackModels => "Fallback models",
+        }
+    }
+
+    /// The singular noun for one entry (used in hints / empty state).
+    fn item_noun(self) -> &'static str {
+        match self {
+            ListKind::ToolsAllow => "tool",
+            ListKind::EgressAllow => "domain",
+            ListKind::FallbackModels => "model",
+        }
+    }
 }
 
 impl AdvField {
     /// Every Advanced field in display order; `adv_focus` indexes this list.
-    const ALL: [AdvField; 6] = [
+    const ALL: [AdvField; 10] = [
         AdvField::Traces,
         AdvField::OnlineEvolution,
         AdvField::WorkflowLive,
         AdvField::CredentialBackend,
         AdvField::EgressGuard,
+        AdvField::EgressAllowlist,
+        AdvField::ToolAllowList,
+        AdvField::FailoverEnabled,
+        AdvField::FallbackChain,
         AdvField::ProviderCosts,
     ];
 
@@ -402,7 +456,9 @@ impl AdvField {
                 "OBSERVABILITY"
             }
             AdvField::CredentialBackend => "STORAGE",
-            AdvField::EgressGuard => "SECURITY",
+            AdvField::EgressGuard | AdvField::EgressAllowlist => "SECURITY",
+            AdvField::ToolAllowList => "TOOLS",
+            AdvField::FailoverEnabled | AdvField::FallbackChain => "FAILOVER",
             AdvField::ProviderCosts => "PROVIDER",
         }
     }
@@ -414,6 +470,10 @@ impl AdvField {
             AdvField::WorkflowLive => "Workflow live mode",
             AdvField::CredentialBackend => "Credential store",
             AdvField::EgressGuard => "Egress guard",
+            AdvField::EgressAllowlist => "Egress allowlist",
+            AdvField::ToolAllowList => "Pre-approved tools",
+            AdvField::FailoverEnabled => "Provider failover",
+            AdvField::FallbackChain => "Fallback models",
             AdvField::ProviderCosts => "Provider cost tuning",
         }
     }
@@ -429,7 +489,25 @@ impl AdvField {
                 "Where API keys live: the OS keyring or a 0600 plaintext file."
             }
             AdvField::EgressGuard => "Restrict outbound network calls to an allowlist.",
+            AdvField::EgressAllowlist => {
+                "Extra domains/hosts allowed past the egress guard (⏎ to edit)."
+            }
+            AdvField::ToolAllowList => "Tools auto-approved without a per-call prompt (⏎ to edit).",
+            AdvField::FailoverEnabled => {
+                "Wrap the provider in a circuit breaker with a fallback chain."
+            }
+            AdvField::FallbackChain => "Models tried in order when the primary fails (⏎ to edit).",
             AdvField::ProviderCosts => "Per-token pricing overrides for the active provider.",
+        }
+    }
+
+    /// The list collection this field opens, or `None` for non-list fields.
+    fn list_kind(self) -> Option<ListKind> {
+        match self {
+            AdvField::EgressAllowlist => Some(ListKind::EgressAllow),
+            AdvField::ToolAllowList => Some(ListKind::ToolsAllow),
+            AdvField::FallbackChain => Some(ListKind::FallbackModels),
+            _ => None,
         }
     }
 }
@@ -450,6 +528,10 @@ enum Tier {
     /// Tier A — Advanced: observability / storage / security editors, plus a
     /// link into the Expert provider-cost pane (S6).
     Advanced,
+    /// Tier L — a string-list collection editor (S7): the tools allow-list,
+    /// the egress allowlist, or the provider failover chain. The payload says
+    /// which collection is open.
+    ListEdit(ListKind),
     /// Tier P — Tools & Providers list (v0.9.0 W4 E1 Part A).
     Providers,
 }
@@ -474,6 +556,15 @@ pub struct ConfigSurface {
     expert_focus: usize,
     /// The focused Advanced field index (Tier A only); indexes `AdvField::ALL`.
     adv_focus: usize,
+    /// The focused entry index in the open list collection (Tier `ListEdit`).
+    list_focus: usize,
+    /// `Some` while a list entry is being typed (add or edit): the `tui-input`
+    /// buffer. `list_edit_index` says whether it's an add (`None`) or an edit
+    /// of entry `i` (`Some(i)`). `None` when no inline list edit is in flight.
+    list_editor: Option<Input>,
+    /// `Some(i)` when the in-flight list edit replaces entry `i`; `None` when
+    /// it appends a new entry. Meaningless unless `list_editor` is `Some`.
+    list_edit_index: Option<usize>,
     /// `Some` while a text field is being edited; the edited row plus its
     /// `tui-input` buffer. `None` when no field edit is in flight.
     editor: Option<(Row, Input)>,
@@ -522,6 +613,9 @@ impl ConfigSurface {
             tier: Tier::Overview,
             expert_focus: 0,
             adv_focus: 0,
+            list_focus: 0,
+            list_editor: None,
+            list_edit_index: None,
             editor: None,
             expert_editor: None,
             save_pending: false,
@@ -587,6 +681,10 @@ impl ConfigSurface {
         let obs_workflow_live = self.current.obs_workflow_live;
         let storage_backend = self.current.storage_backend.clone();
         let egress_enabled = self.current.security_egress_enabled;
+        let tools_allow_list = self.current.tools_allow_list.clone();
+        let egress_allow = self.current.egress_allow.clone();
+        let failover_enabled = self.current.failover_enabled;
+        let fallback_models = self.current.fallback_models.clone();
         wcore_config::config::patch_global_config(|f| {
             f.default.max_turns = max_turns;
             f.default.approval_mode = approval_mode;
@@ -622,6 +720,14 @@ impl ConfigSurface {
                 _ => {} // encrypted-file or unknown: leave the configured backend
             }
             f.security.enabled = egress_enabled;
+            // S7 collection editors: the tools allow-list, the egress
+            // allowlist, and the provider failover chain (+ its on/off). Each
+            // is a `Vec<String>` / `bool` on a non-Option table, so set it
+            // directly; the partial-merge writer preserves every other key.
+            f.tools.allow_list = tools_allow_list;
+            f.security.egress_allow = egress_allow;
+            f.provider_chain.enabled = failover_enabled;
+            f.provider_chain.fallback_models = fallback_models;
         })
         .map(|_| ())
         .map_err(|e| format!("{e:#}"))
@@ -1602,6 +1708,9 @@ impl Surface for ConfigSurface {
         self.tier = Tier::Overview;
         self.expert_focus = 0;
         self.adv_focus = 0;
+        self.list_focus = 0;
+        self.list_editor = None;
+        self.list_edit_index = None;
         self.editor = None;
         self.expert_editor = None;
         self.providers_focus = 0;
@@ -1626,6 +1735,7 @@ impl Surface for ConfigSurface {
             }
             Tier::Expert => self.render_expert(frame, area, theme),
             Tier::Advanced => self.render_advanced(frame, area, theme),
+            Tier::ListEdit(kind) => self.render_list(frame, area, theme, kind),
             Tier::Providers => {
                 self.render_providers(frame, area, theme);
                 if self.credentials_modal.is_some() {
@@ -1675,6 +1785,26 @@ impl Surface for ConfigSurface {
             return SurfaceAction::None;
         }
 
+        // A list-entry edit (Tier `ListEdit`) captures every key like the other
+        // inline editors. `⏎` commits the typed entry into the buffer (which
+        // makes the surface dirty but does NOT persist — the save happens on
+        // `esc` out of the list tier); `esc` cancels the in-flight entry.
+        if self.list_editor.is_some() {
+            match key.code {
+                KeyCode::Enter => self.commit_list_edit(),
+                KeyCode::Esc => {
+                    self.list_editor = None;
+                    self.list_edit_index = None;
+                }
+                _ => {
+                    if let Some(input) = self.list_editor.as_mut() {
+                        input.handle_event(&ratatui::crossterm::event::Event::Key(key));
+                    }
+                }
+            }
+            return SurfaceAction::None;
+        }
+
         // D007: a Tier-1 save lands deep inside a per-tier key handler with
         // no router/engine access. Snapshot the baseline before dispatch;
         // if the dispatch persisted a change (baseline advanced to current
@@ -1686,6 +1816,7 @@ impl Surface for ConfigSurface {
             Tier::Detail => self.handle_detail_key(key),
             Tier::Expert => self.handle_expert_key(key),
             Tier::Advanced => self.handle_advanced_key(key),
+            Tier::ListEdit(kind) => self.handle_list_key(key, kind),
             Tier::Providers => self.handle_providers_key(key),
         };
         if self.baseline != baseline_before && !self.is_dirty() {
@@ -2063,7 +2194,7 @@ impl ConfigSurface {
                 v.push(Span::styled(
                     format!(
                         "   {} allowed · verify-edits {}",
-                        self.current.tools_allow_count,
+                        self.current.tools_allow_list.len(),
                         if self.current.tools_verify_edits {
                             "on"
                         } else {
@@ -2287,6 +2418,11 @@ impl ConfigSurface {
             AdvField::EgressGuard => {
                 self.current.security_egress_enabled = !self.current.security_egress_enabled
             }
+            AdvField::FailoverEnabled => {
+                self.current.failover_enabled = !self.current.failover_enabled
+            }
+            // List-collection fields are `⏎`-to-open, not `space`-to-toggle.
+            AdvField::EgressAllowlist | AdvField::ToolAllowList | AdvField::FallbackChain => {}
             AdvField::CredentialBackend => {
                 // Cycle plaintext↔keyring. encrypted-file is read-only — never
                 // reconstruct its two paths from a radio.
@@ -2317,9 +2453,12 @@ impl ConfigSurface {
                 SurfaceAction::None
             }
             KeyCode::Enter => {
-                if self.focused_adv() == AdvField::ProviderCosts {
+                let field = self.focused_adv();
+                if field == AdvField::ProviderCosts {
                     self.tier = Tier::Expert;
                     self.expert_focus = 0;
+                } else if let Some(kind) = field.list_kind() {
+                    self.open_list(kind);
                 } else {
                     self.toggle_adv();
                 }
@@ -2348,6 +2487,18 @@ impl ConfigSurface {
             AdvField::WorkflowLive => toggle_strip(self.current.obs_workflow_live, "off", "on", t),
             AdvField::EgressGuard => {
                 toggle_strip(self.current.security_egress_enabled, "off", "allowlist", t)
+            }
+            AdvField::FailoverEnabled => {
+                toggle_strip(self.current.failover_enabled, "off", "on", t)
+            }
+            AdvField::EgressAllowlist => {
+                list_count_spans(self.current.egress_allow.len(), "domain", t)
+            }
+            AdvField::ToolAllowList => {
+                list_count_spans(self.current.tools_allow_list.len(), "tool", t)
+            }
+            AdvField::FallbackChain => {
+                list_count_spans(self.current.fallback_models.len(), "model", t)
             }
             AdvField::CredentialBackend => match self.current.storage_backend.as_str() {
                 "encrypted-file" => vec![Span::styled(
@@ -2424,6 +2575,233 @@ impl ConfigSurface {
             Span::styled("esc ", Style::default().fg(t.orange)),
             Span::styled("save & back", Style::default().fg(t.text_dim)),
         ]);
+        let promise = Line::from(Span::styled(
+            " changes save to your global config.toml and apply live",
+            Style::default().fg(t.text_muted),
+        ));
+        frame.render_widget(Paragraph::new(vec![hints, promise]), footer_area);
+    }
+
+    // ── Tier L (list collection) input + rendering — S7 ─────────────────
+
+    /// The open collection's entries (read-only view).
+    fn list_ref(&self, kind: ListKind) -> &[String] {
+        match kind {
+            ListKind::ToolsAllow => &self.current.tools_allow_list,
+            ListKind::EgressAllow => &self.current.egress_allow,
+            ListKind::FallbackModels => &self.current.fallback_models,
+        }
+    }
+
+    /// The open collection's entries (mutable).
+    fn list_mut(&mut self, kind: ListKind) -> &mut Vec<String> {
+        match kind {
+            ListKind::ToolsAllow => &mut self.current.tools_allow_list,
+            ListKind::EgressAllow => &mut self.current.egress_allow,
+            ListKind::FallbackModels => &mut self.current.fallback_models,
+        }
+    }
+
+    /// Open the list editor for `kind` (from an Advanced list field's `⏎`).
+    fn open_list(&mut self, kind: ListKind) {
+        self.tier = Tier::ListEdit(kind);
+        self.list_focus = 0;
+        self.list_editor = None;
+        self.list_edit_index = None;
+    }
+
+    /// Move the list selection, wrapping. Inert on an empty collection.
+    fn move_list(&mut self, delta: isize, kind: ListKind) {
+        let len = self.list_ref(kind).len();
+        if len == 0 {
+            self.list_focus = 0;
+            return;
+        }
+        self.list_focus =
+            (self.list_focus.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Remove the focused entry, clamping focus to the new bounds.
+    fn remove_focused_entry(&mut self, kind: ListKind) {
+        self.save_error = None;
+        self.save_pending = false;
+        let len = self.list_ref(kind).len();
+        if len == 0 {
+            return;
+        }
+        let i = self.list_focus.min(len - 1);
+        self.list_mut(kind).remove(i);
+        let new_len = len - 1;
+        self.list_focus = if new_len == 0 { 0 } else { i.min(new_len - 1) };
+    }
+
+    /// Tier-L keys: `↑↓` move, `a` add, `e`/`⏎` edit the focused entry (`⏎` on
+    /// an empty list adds), `d`/`Del` remove, `esc` saves and returns to
+    /// Advanced. The in-flight entry edit itself is captured earlier in
+    /// `handle_key` (the `list_editor` state machine).
+    fn handle_list_key(&mut self, key: KeyEvent, kind: ListKind) -> SurfaceAction {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.move_list(-1, kind);
+                SurfaceAction::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.move_list(1, kind);
+                SurfaceAction::None
+            }
+            KeyCode::Char('a') | KeyCode::Char('+') => {
+                self.save_error = None;
+                self.save_pending = false;
+                self.list_editor = Some(Input::new(String::new()));
+                self.list_edit_index = None;
+                SurfaceAction::None
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                self.save_error = None;
+                self.save_pending = false;
+                let len = self.list_ref(kind).len();
+                if len == 0 {
+                    self.list_editor = Some(Input::new(String::new()));
+                    self.list_edit_index = None;
+                } else {
+                    let i = self.list_focus.min(len - 1);
+                    let seed = self.list_ref(kind)[i].clone();
+                    self.list_editor = Some(Input::new(seed));
+                    self.list_edit_index = Some(i);
+                }
+                SurfaceAction::None
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                self.remove_focused_entry(kind);
+                SurfaceAction::None
+            }
+            KeyCode::Esc => {
+                // Persist the (possibly) changed collection — `save` advances
+                // `baseline`, which the `handle_key` seam detects to raise the
+                // Tier1Save rebind so the change applies live — then back to
+                // the Advanced tier the list field lives on.
+                if self.is_dirty() {
+                    self.save();
+                }
+                self.tier = Tier::Advanced;
+                SurfaceAction::None
+            }
+            _ => SurfaceAction::None,
+        }
+    }
+
+    /// Commit the in-flight list entry (`⏎`). A blank entry is dropped (no
+    /// add, no change to an edited entry). Edits replace in place; adds append
+    /// and move focus to the new entry.
+    fn commit_list_edit(&mut self) {
+        let Some(input) = self.list_editor.take() else {
+            return;
+        };
+        let idx = self.list_edit_index.take();
+        let kind = match self.tier {
+            Tier::ListEdit(k) => k,
+            _ => return,
+        };
+        let val = input.value().trim().to_string();
+        if val.is_empty() {
+            return;
+        }
+        let list = self.list_mut(kind);
+        let new_focus = match idx {
+            Some(i) if i < list.len() => {
+                list[i] = val;
+                i
+            }
+            _ => {
+                list.push(val);
+                list.len() - 1
+            }
+        };
+        self.list_focus = new_focus;
+    }
+
+    /// The live entry-edit buffer line (`▸ typed_`), shown in the entry's slot
+    /// while editing or as a trailing line while adding.
+    fn list_editor_line(&self, t: &Theme) -> Line<'static> {
+        let buf = self
+            .list_editor
+            .as_ref()
+            .map(|i| i.value().to_string())
+            .unwrap_or_default();
+        Line::from(vec![
+            Span::styled("▸ ".to_string(), Style::default().fg(t.orange)),
+            Span::styled(
+                format!("{buf}_"),
+                Style::default().fg(t.orange).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }
+
+    /// Draw the Tier-L list editor: the collection's entries with a focus
+    /// marker, an inline buffer when adding/editing, and the key hints.
+    fn render_list(&self, frame: &mut Frame, area: Rect, t: &Theme, kind: ListKind) {
+        let block = panel(&format!("Wayland · {}", kind.title()), t);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 3 || inner.width < 10 {
+            return;
+        }
+        let [body_area, footer_area] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+
+        let entries = self.list_ref(kind);
+        let editing = self.list_editor.is_some();
+        let mut lines: Vec<Line> = Vec::new();
+        if entries.is_empty() && !editing {
+            lines.push(Line::from(Span::styled(
+                format!("  no {}s yet — press a to add one", kind.item_noun()),
+                Style::default().fg(t.text_muted),
+            )));
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if editing && self.list_edit_index == Some(i) {
+                lines.push(self.list_editor_line(t));
+                continue;
+            }
+            let focused = i == self.list_focus && !editing;
+            let marker = if focused { "▸ " } else { "  " };
+            let style = if focused {
+                Style::default().fg(t.orange).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.text)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), Style::default().fg(t.orange)),
+                Span::styled(entry.clone(), style),
+            ]));
+        }
+        // An add-in-flight (no edit index) renders as a trailing buffer line.
+        if editing && self.list_edit_index.is_none() {
+            lines.push(self.list_editor_line(t));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body_area);
+
+        let hints = if editing {
+            Line::from(vec![
+                Span::styled(" ⏎ ", Style::default().fg(t.orange)),
+                Span::styled("save entry   ", Style::default().fg(t.text_dim)),
+                Span::styled("esc ", Style::default().fg(t.orange)),
+                Span::styled("cancel entry", Style::default().fg(t.text_dim)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" ↑↓ ", Style::default().fg(t.orange)),
+                Span::styled("move   ", Style::default().fg(t.text_dim)),
+                Span::styled("a ", Style::default().fg(t.orange)),
+                Span::styled("add   ", Style::default().fg(t.text_dim)),
+                Span::styled("e ", Style::default().fg(t.orange)),
+                Span::styled("edit   ", Style::default().fg(t.text_dim)),
+                Span::styled("d ", Style::default().fg(t.orange)),
+                Span::styled("delete   ", Style::default().fg(t.text_dim)),
+                Span::styled("esc ", Style::default().fg(t.orange)),
+                Span::styled("save & back", Style::default().fg(t.text_dim)),
+            ])
+        };
         let promise = Line::from(Span::styled(
             " changes save to your global config.toml and apply live",
             Style::default().fg(t.text_muted),
@@ -2916,6 +3294,21 @@ fn toggle_strip(on: bool, off_label: &str, on_label: &str, t: &Theme) -> Vec<Spa
         Span::styled(format!("{off_label}   "), off_style),
         Span::styled(on_glyph.to_string(), on_style),
         Span::styled(on_label.to_string(), on_style),
+    ]
+}
+
+/// The value-side read-out for an Advanced list field: `N nouns · ⏎ edit`,
+/// or `none · ⏎ add` when the collection is empty. `noun` is the singular.
+fn list_count_spans(count: usize, noun: &str, t: &Theme) -> Vec<Span<'static>> {
+    let summary = if count == 0 {
+        "none".to_string()
+    } else {
+        format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+    };
+    let action = if count == 0 { "⏎ add" } else { "⏎ edit" };
+    vec![
+        Span::styled(summary, Style::default().fg(t.text)),
+        Span::styled(format!("   {action}"), Style::default().fg(t.text_muted)),
     ]
 }
 
@@ -4066,6 +4459,190 @@ mod tests {
         }
     }
 
+    // ── S7: collection (list) editors ───────────────────────────────────
+
+    /// Open the Tier-L list editor for a given Advanced list field: `x` to
+    /// Advanced, walk to the field, `⏎` to open.
+    fn open_advanced_list(surface: &mut ConfigSurface, app: &mut App, target: AdvField) {
+        surface.handle_key(ch('x'), app);
+        assert_eq!(surface.tier, Tier::Advanced);
+        let mut guard = 0;
+        while surface.focused_adv() != target {
+            surface.handle_key(key(KeyCode::Down), app);
+            guard += 1;
+            assert!(guard < 50, "could not reach {target:?}");
+        }
+        surface.handle_key(key(KeyCode::Enter), app);
+        assert!(
+            matches!(surface.tier, Tier::ListEdit(_)),
+            "⏎ on a list field must open the list editor"
+        );
+    }
+
+    #[test]
+    fn list_editor_add_renders_live_buffer_and_commits() {
+        // Adding an entry shows the live buffer + cursor in the RENDERED frame,
+        // and `⏎` commits it into the collection.
+        let mut app = App::new();
+        let mut surface = ConfigSurface::new();
+        surface.on_enter(&mut app);
+        open_advanced_list(&mut surface, &mut app, AdvField::EgressAllowlist);
+        surface.handle_key(ch('a'), &mut app); // begin add
+        for c in "example.com".chars() {
+            surface.handle_key(ch(c), &mut app);
+        }
+        let frame = render_text(&mut surface, &app);
+        assert!(
+            frame.contains("example.com_"),
+            "the live entry buffer + cursor must render, got:\n{frame}"
+        );
+        surface.handle_key(key(KeyCode::Enter), &mut app); // commit
+        assert!(surface.list_editor.is_none(), "commit clears the buffer");
+        assert_eq!(
+            surface.current.egress_allow,
+            vec!["example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn list_editor_blank_entry_is_dropped() {
+        // Committing an empty buffer must not add a phantom entry.
+        let mut app = App::new();
+        let mut surface = ConfigSurface::new();
+        surface.on_enter(&mut app);
+        open_advanced_list(&mut surface, &mut app, AdvField::EgressAllowlist);
+        surface.handle_key(ch('a'), &mut app); // begin add
+        surface.handle_key(key(KeyCode::Enter), &mut app); // commit empty
+        assert!(
+            surface.current.egress_allow.is_empty(),
+            "a blank commit must not add an entry"
+        );
+    }
+
+    #[test]
+    fn tools_allow_list_delete_and_add_mutate_the_collection() {
+        // `d` removes the focused entry; `a` + type + `⏎` appends one.
+        let mut app = App::new();
+        app.config.tools_allow_list = vec!["Read".to_string(), "Grep".to_string()];
+        let mut surface = ConfigSurface::new();
+        surface.on_enter(&mut app); // seeds current from the config view
+        assert_eq!(
+            surface.current.tools_allow_list,
+            vec!["Read".to_string(), "Grep".to_string()]
+        );
+        open_advanced_list(&mut surface, &mut app, AdvField::ToolAllowList);
+        surface.handle_key(ch('d'), &mut app); // delete focused (index 0 = Read)
+        assert_eq!(surface.current.tools_allow_list, vec!["Grep".to_string()]);
+        surface.handle_key(ch('a'), &mut app); // begin add
+        for c in "Bash".chars() {
+            surface.handle_key(ch(c), &mut app);
+        }
+        surface.handle_key(key(KeyCode::Enter), &mut app); // commit
+        assert_eq!(
+            surface.current.tools_allow_list,
+            vec!["Grep".to_string(), "Bash".to_string()]
+        );
+    }
+
+    #[test]
+    fn egress_allowlist_add_persists_to_security() {
+        // Add an entry, then `esc` saves the collection to `[security]
+        // egress_allow` on disk. Hermetic via WAYLAND_HOME under the env lock.
+        let _guard = EXPERT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("WAYLAND_HOME");
+        // SAFETY: serialised by EXPERT_ENV_LOCK; restored before unlock.
+        unsafe { std::env::set_var("WAYLAND_HOME", dir.path()) };
+
+        let mut app = App::new();
+        let mut surface = ConfigSurface::new();
+        surface.on_enter(&mut app);
+        open_advanced_list(&mut surface, &mut app, AdvField::EgressAllowlist);
+        surface.handle_key(ch('a'), &mut app);
+        for c in "myapp.workers.dev".chars() {
+            surface.handle_key(ch(c), &mut app);
+        }
+        surface.handle_key(key(KeyCode::Enter), &mut app); // commit
+        surface.handle_key(key(KeyCode::Esc), &mut app); // save & back to Advanced
+        assert_eq!(surface.tier, Tier::Advanced);
+        assert!(!surface.is_dirty(), "esc must save the collection");
+        let written = std::fs::read_to_string(dir.path().join("config.toml"))
+            .expect("config.toml should have been written");
+        assert!(
+            written.contains("egress_allow") && written.contains("myapp.workers.dev"),
+            "the entry must persist to [security].egress_allow, got:\n{written}"
+        );
+
+        // SAFETY: restore the prior env under the same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("WAYLAND_HOME", v),
+                None => std::env::remove_var("WAYLAND_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn failover_toggle_and_fallback_chain_persist_to_provider_chain() {
+        // Enabling failover then adding a fallback model persists both
+        // `[provider_chain] enabled` and `fallback_models` on a single save.
+        let _guard = EXPERT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("WAYLAND_HOME");
+        // SAFETY: serialised by EXPERT_ENV_LOCK; restored before unlock.
+        unsafe { std::env::set_var("WAYLAND_HOME", dir.path()) };
+
+        let mut app = App::new();
+        let mut surface = ConfigSurface::new();
+        surface.on_enter(&mut app);
+        // Enable failover (a toggle field).
+        surface.handle_key(ch('x'), &mut app);
+        let mut guard = 0;
+        while surface.focused_adv() != AdvField::FailoverEnabled {
+            surface.handle_key(key(KeyCode::Down), &mut app);
+            guard += 1;
+            assert!(guard < 50);
+        }
+        surface.handle_key(key(KeyCode::Char(' ')), &mut app);
+        assert!(
+            surface.current.failover_enabled,
+            "space must enable failover"
+        );
+        // Walk to the chain list and add a model.
+        while surface.focused_adv() != AdvField::FallbackChain {
+            surface.handle_key(key(KeyCode::Down), &mut app);
+        }
+        surface.handle_key(key(KeyCode::Enter), &mut app); // open the (empty) list
+        assert!(matches!(surface.tier, Tier::ListEdit(_)));
+        surface.handle_key(ch('a'), &mut app);
+        for c in "anthropic:haiku".chars() {
+            surface.handle_key(ch(c), &mut app);
+        }
+        surface.handle_key(key(KeyCode::Enter), &mut app); // commit
+        assert_eq!(
+            surface.current.fallback_models,
+            vec!["anthropic:haiku".to_string()]
+        );
+        surface.handle_key(key(KeyCode::Esc), &mut app); // save & back
+        assert!(!surface.is_dirty());
+        let written = std::fs::read_to_string(dir.path().join("config.toml"))
+            .expect("config.toml should have been written");
+        assert!(
+            written.contains("[provider_chain]")
+                && written.contains("fallback_models")
+                && written.contains("anthropic:haiku"),
+            "the chain must persist to [provider_chain].fallback_models, got:\n{written}"
+        );
+
+        // SAFETY: restore the prior env under the same lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("WAYLAND_HOME", v),
+                None => std::env::remove_var("WAYLAND_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn overview_esc_closes_when_nothing_is_dirty() {
         // With no pending edits, `esc` closes back to the workspace.
@@ -4286,6 +4863,7 @@ mod tests {
             Tier::Detail,
             Tier::Expert,
             Tier::Advanced,
+            Tier::ListEdit(ListKind::ToolsAllow),
             Tier::Providers,
         ] {
             surface.tier = tier;
