@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.10](https://github.com/FerroxLabs/wayland-core/compare/v0.12.9...v0.12.10) (2026-06-27)
+
+
+### Features
+
+* **mcp:** provider-aware hard cap on total tool count + real MCP server provenance + BM25 relevance curation — caps the outbound tool array to the model's limit (OpenAI 128), fixing API-400 overflow with large MCP servers (Google Workspace, etc.); fixes uniquely-named MCP tools being misclassified as built-ins ([#86](https://github.com/FerroxLabs/wayland-core/issues/86), [#344](https://github.com/FerroxLabs/wayland-core/issues/344)/[#359](https://github.com/FerroxLabs/wayland-core/issues/359)) ([#87](https://github.com/FerroxLabs/wayland-core/issues/87))
+
+
+### Bug Fixes
+
+* **deps:** bump pdf-extract 0.12 → lopdf 0.42 ([RUSTSEC-2026-0187](https://rustsec.org/advisories/RUSTSEC-2026-0187)) ([#87](https://github.com/FerroxLabs/wayland-core/issues/87))
+* **web-fetch:** wall-clock timeout message now contains "timed out" (de-flake) ([#87](https://github.com/FerroxLabs/wayland-core/issues/87))
+
 ## [0.12.9](https://github.com/FerroxLabs/wayland-core/compare/v0.12.8...v0.12.9) (2026-06-25)
 
 
