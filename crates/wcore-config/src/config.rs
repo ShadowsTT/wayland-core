@@ -379,6 +379,15 @@ pub struct MemoryConfig {
     /// activates the M4.6 / M4.7 / M4.7b backends when those land.
     #[serde(default)]
     pub embedder: EmbedderConfig,
+
+    /// [0.12.0 P0 HF-2 / D8] Gates the autonomous auto-skill drafting loop.
+    /// Default `false`: the `SkillDrafter` (which writes candidate skills to
+    /// `$WAYLAND_HOME/skills/auto/` and seeds them back into GEPA next session)
+    /// is a self-triggering loop, so it must be explicitly opted in rather than
+    /// running whenever `memory.enabled` is true. Set `auto_skill = true` under
+    /// `[memory]` in wcore.toml to enable it.
+    #[serde(default)]
+    pub auto_skill: bool,
 }
 
 /// M4.5 — embedding backend selection. Defaults to the deterministic
@@ -438,6 +447,8 @@ impl Default for MemoryConfig {
             dream_cycle_throttle_secs: default_dream_throttle_secs(),
             decay_interval_secs: default_decay_interval_secs(),
             embedder: EmbedderConfig::default(),
+            // HF-2 / D8: auto-skill loop is opt-in, off by default.
+            auto_skill: false,
         }
     }
 }

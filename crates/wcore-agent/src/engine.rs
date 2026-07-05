@@ -5738,17 +5738,32 @@ impl AgentEngine {
             // The adapter owns Arc clones of registry/confirmer; the
             // hook engine is moved into the cell via `take()` and moved
             // back out after the graph walk.
-            let approval_channel = self.approval_manager.as_ref().map(|mgr| {
-                let writer = self
-                    .protocol_writer
-                    .as_ref()
-                    .expect("protocol writer required for approval")
-                    .clone();
+            let approval_channel = self.approval_manager.as_ref().and_then(|mgr| {
+                // HF-3: `approval_manager` and `protocol_writer` are wired
+                // together by every call site (`set_approval_manager` /
+                // `set_protocol_writer`), but nothing in the type system
+                // enforces that invariant. Previously a violation (manager
+                // set, writer missing) panicked here and crashed the whole
+                // engine turn. Fail CLOSED instead: drop the JSON-protocol
+                // approval channel and log loudly. `exec_cfg.approval =
+                // None` below routes dispatch through the budget-aware
+                // terminal-confirmation path (`execute_tool_calls_with_budget`),
+                // which still gates every tool call through `self.confirmer`
+                // — it never silently auto-approves.
+                let Some(writer) = self.protocol_writer.as_ref() else {
+                    tracing::error!(
+                        "approval invariant violated: approval_manager is set but \
+                         protocol_writer is not; falling back to terminal \
+                         confirmation instead of panicking"
+                    );
+                    return None;
+                };
+                let writer = writer.clone();
                 // SAFETY: see confirm_call in orchestration/mod.rs —
                 // ToolConfirmer's critical sections cannot panic so
                 // the std::sync::Mutex can never be poisoned.
                 let auto_approve = self.confirmer.lock().unwrap().is_auto_approve();
-                ApprovalChannel {
+                Some(ApprovalChannel {
                     manager: mgr.clone(),
                     writer,
                     msg_id: self.current_msg_id.clone(),
@@ -5758,7 +5773,7 @@ impl AgentEngine {
                     // redactor tracks the live in-flight correlation-id set
                     // regardless of transport (ACP, TUI, json-stream).
                     redactor: self.approval_bridge.redactor(),
-                }
+                })
             });
             let exec_cfg = AgentExecutorConfig {
                 tools: self.tools.clone(),
@@ -15265,6 +15280,43 @@ mod audit_2026_05_22_tests {
         ]]));
         let mut engine = engine_with(provider);
         let result = engine.run("task", "m-1").await.expect("clean run");
+        assert_eq!(result.stop_reason, StopReason::EndTurn);
+    }
+
+    // --- HF-3: approval invariant must fail closed, not panic ------------
+
+    #[tokio::test]
+    async fn approval_manager_without_writer_fails_closed_not_panic() {
+        // Regression: `approval_manager` wired without a `protocol_writer`
+        // (an invariant every real call site upholds, but nothing in the
+        // type system enforces) used to `.expect()` and panic mid-turn.
+        // It must instead fail closed — drop the JSON-protocol approval
+        // channel, fall back to the terminal-confirmation dispatch path,
+        // and let the turn complete normally.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                LlmEvent::ToolUse {
+                    id: "t1".into(),
+                    name: "Nope".into(),
+                    input: json!({}),
+                    extra: None,
+                },
+                LlmEvent::Done {
+                    stop_reason: StopReason::ToolUse,
+                    finish_reason: FinishReason::Stop,
+                    usage: TokenUsage::default(),
+                },
+            ],
+            vec![LlmEvent::TextDelta("done".into()), done_endturn()],
+        ]));
+        let mut engine = engine_with(provider);
+        // Violate the invariant on purpose: set the approval manager but
+        // never call `set_protocol_writer`.
+        engine.set_approval_manager(Arc::new(wcore_protocol::ToolApprovalManager::new()));
+        let result = engine
+            .run("task", "m-1")
+            .await
+            .expect("must fail closed, not panic");
         assert_eq!(result.stop_reason, StopReason::EndTurn);
     }
 

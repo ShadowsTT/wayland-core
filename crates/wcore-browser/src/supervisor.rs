@@ -321,6 +321,24 @@ fn terminate_session(session: &str, pid: u32) {
     }
 }
 
+/// Kill every stashed backend child process this host process has spawned.
+///
+/// HF-1: an OS-level `SIGTERM`/`SIGINT`/`SIGHUP` to the host is handled by
+/// exiting via `std::process::exit`, which skips Rust's `Drop` glue (so
+/// `kill_on_drop` on the stashed [`tokio::process::Child`] handles never
+/// fires) and races the in-process orphan reaper, which normally catches
+/// this case but dies together with the parent it's supposed to be
+/// watching. Without an explicit call here, browser sidecars spawned via
+/// `launch_camoufox` are orphaned by a signal-driven shutdown instead of
+/// being stopped cleanly. Mirrors `terminate_session`'s kill mechanism —
+/// same best-effort `start_kill`, just applied to every tracked child
+/// instead of one.
+pub fn kill_all_children() {
+    for (_, mut child) in children_map().lock().drain() {
+        let _ = child.start_kill();
+    }
+}
+
 /// Returns `true` if the process with `pid` is alive. Implementation:
 ///   * Unix: `kill(pid, 0)` returns 0 on success → alive.
 ///   * Windows: spawn `tasklist /FI "PID eq <pid>" /NH /FO CSV`; alive iff
@@ -581,6 +599,34 @@ mod tests {
         assert!(
             !children_map().lock().contains_key(sid),
             "on_session_end must remove the stashed child handle"
+        );
+    }
+
+    // HF-1: `kill_all_children` must drain every stashed handle and kill it,
+    // regardless of how many sessions are tracked — used by the wcore-cli
+    // SIGTERM handler so a signal-driven shutdown stops browser sidecars
+    // cleanly instead of orphaning them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_all_children_drains_and_kills_every_stashed_child() {
+        let bin = if std::path::Path::new("/bin/sleep").exists() {
+            "/bin/sleep"
+        } else {
+            "sleep"
+        };
+        for sid in ["kill-all-a", "kill-all-b"] {
+            let child = tokio::process::Command::new(bin)
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sleep");
+            retain_child(sid, child);
+        }
+        assert_eq!(children_map().lock().len(), 2);
+        kill_all_children();
+        assert!(
+            children_map().lock().is_empty(),
+            "kill_all_children must drain the stashed-child map"
         );
     }
 

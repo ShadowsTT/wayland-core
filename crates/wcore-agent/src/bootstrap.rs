@@ -2179,6 +2179,9 @@ impl AgentBootstrap {
             registry.set_workspace_policy(policy);
         }
 
+        // HF-2 / D8: read the auto-skill opt-in before `self.config` is moved
+        // into the engine below.
+        let auto_skill_enabled = self.config.memory.auto_skill;
         let mut engine = if let Some(session) = self.resume_session {
             AgentEngine::resume_with_provider(
                 provider.clone(),
@@ -2264,7 +2267,15 @@ impl AgentBootstrap {
         // `Db` is available — without one we have no PromptStore and the
         // closed-loop seed pathway is dead. The bucketer itself is always
         // live on the engine; without a drafter it just observes.
-        if let Some(db_arc) = mem_db_for_router.clone() {
+        //
+        // [0.12.0 P0 HF-2 / D8] The drafter is a self-triggering loop (it writes
+        // skills that seed next session's router), so it is now opt-in: gated on
+        // `memory.auto_skill` (default false) instead of running whenever a Db
+        // exists. The bucketer stays live regardless, so enabling the flag has
+        // immediate history to draft from.
+        if auto_skill_enabled
+            && let Some(db_arc) = mem_db_for_router.clone()
+        {
             // `$WAYLAND_HOME` resolution: prefer the explicit env var,
             // fall back to `~/.wayland`. Matches the pattern used elsewhere
             // in the project for user-facing on-disk artifacts.

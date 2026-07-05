@@ -40,7 +40,7 @@ pub fn build_messages(messages: &[Message], compat: &ProviderCompat) -> Vec<Valu
                     let tool_id = if id.is_empty() && compat.auto_tool_id() {
                         generate_tool_id()
                     } else {
-                        id.clone()
+                        sanitize_tool_use_id(id)
                     };
                     Some(json!({
                         "type": "tool_use",
@@ -55,7 +55,7 @@ pub fn build_messages(messages: &[Message], compat: &ProviderCompat) -> Vec<Valu
                     is_error,
                 } => Some(json!({
                     "type": "tool_result",
-                    "tool_use_id": tool_use_id,
+                    "tool_use_id": sanitize_tool_use_id(tool_use_id),
                     "content": content,
                     "is_error": is_error
                 })),
@@ -180,6 +180,35 @@ fn ensure_message_alternation(messages: &mut Vec<Value>) {
         }
         i += 1;
     }
+}
+
+/// Anthropic requires `tool_use.id` (and the `tool_result.tool_use_id` that
+/// references it back) to match `^[a-zA-Z0-9_-]+$`. IDs we mint ourselves
+/// (`generate_tool_id` below, or Anthropic's own `toolu_…` echoed back from a
+/// prior turn) already satisfy this, but IDs synthesized by OTHER providers
+/// do not: Gemini's `make_tool_id` embeds the raw (decoded) tool name
+/// verbatim — `gemini_call_{name}_{ts}_{tokens}` — and MCP tool names
+/// routinely carry `:`, `.`, spaces (wayland#297's `Browser::execute`,
+/// `tool:brave`). Replaying that history turn against Anthropic (e.g. after
+/// a Flux model switch) 400s the WHOLE request:
+/// `tool_use.id: String should match pattern '^[a-zA-Z0-9_-]+$'`.
+///
+/// Fix once, at the wire boundary, for every id — sweep any disallowed byte
+/// to `_`. Applied identically to both `tool_use.id` and
+/// `tool_result.tool_use_id` in `build_messages`, so a pair built from the
+/// same original id still matches after sanitizing (no reverse mapping
+/// needed: the id is an opaque correlation token, not something the engine
+/// decodes back into a tool name). A no-op for ids that are already legal.
+fn sanitize_tool_use_id(id: &str) -> String {
+    if id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return id.to_string();
+    }
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// Generate a unique tool ID when missing
@@ -686,6 +715,49 @@ mod tests {
         assert_eq!(content[0]["tool_use_id"], "call_1");
         assert_eq!(content[0]["content"], "file list");
         assert_eq!(content[0]["is_error"], false);
+    }
+
+    /// wayland#507: a tool_use id synthesized by another provider (Gemini's
+    /// `make_tool_id` embeds the raw tool name: `gemini_call_{name}_{ts}_{n}`)
+    /// can carry characters Anthropic's `^[a-zA-Z0-9_-]+$` id pattern
+    /// forbids. Replaying that history turn against Anthropic (e.g. after a
+    /// Flux model switch) must not 400 the whole request — every disallowed
+    /// byte is swept to `_`, and the paired tool_result's `tool_use_id` is
+    /// swept identically so the pairing still matches.
+    #[test]
+    fn test_build_messages_sanitizes_non_wire_legal_tool_ids() {
+        let messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: "gemini_call_Browser::execute_123_45".to_string(),
+                    name: "Browser::execute".to_string(),
+                    input: json!({}),
+                    extra: None,
+                }],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "gemini_call_Browser::execute_123_45".to_string(),
+                    content: "ok".to_string(),
+                    is_error: false,
+                }],
+            ),
+        ];
+        let result = build_messages(&messages, &default_compat());
+        let tool_use_id = result[0]["content"][0]["id"].as_str().unwrap();
+        let tool_result_id = result[1]["content"][0]["tool_use_id"].as_str().unwrap();
+        assert!(
+            tool_use_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "sanitized id must be wire-legal, got {tool_use_id:?}"
+        );
+        assert_eq!(
+            tool_use_id, tool_result_id,
+            "tool_use.id and tool_result.tool_use_id must still pair up after sanitizing"
+        );
     }
 
     /// wayland#161: thinking blocks must NOT be replayed — they lack the

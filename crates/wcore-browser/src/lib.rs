@@ -35,7 +35,7 @@ pub use provider::{
     ScreenshotOpts, SessionCtx,
 };
 pub use selection::{ProviderHint, select_provider};
-pub use supervisor::BrowserSupervisor;
+pub use supervisor::{BrowserSupervisor, kill_all_children};
 pub use tool::BrowserTool;
 
 /// Re-export of the host-adapter spec-to-type translator surface. The

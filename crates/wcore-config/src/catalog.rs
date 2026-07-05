@@ -81,11 +81,23 @@ impl ProviderCatalog {
 
     /// Process-wide cached catalog, parsed once. Returns `None` if the bundled
     /// file is malformed (a build-time error that surfaces in tests); callers
-    /// on the resolution path treat `None`/miss as "not a catalog id".
+    /// on the resolution path treat `None`/miss as "not a catalog id" — i.e.
+    /// fail CLOSED (no catalog entries resolve) rather than falling back to
+    /// anything permissive. The failure is also surfaced via `tracing::error!`
+    /// so a broken bundled catalog is loud in logs, not a silent deny.
     pub fn bundled() -> Option<&'static ProviderCatalog> {
         static CACHE: OnceLock<Option<ProviderCatalog>> = OnceLock::new();
         CACHE
-            .get_or_init(|| ProviderCatalog::load_bundled().ok())
+            .get_or_init(|| match ProviderCatalog::load_bundled() {
+                Ok(catalog) => Some(catalog),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "provider catalog failed to load — failing closed: no catalog providers available"
+                    );
+                    None
+                }
+            })
             .as_ref()
     }
 
@@ -167,6 +179,19 @@ mod tests {
     #[test]
     fn cached_bundled_is_some() {
         assert!(ProviderCatalog::bundled().is_some());
+    }
+
+    #[test]
+    fn malformed_toml_fails_closed_not_panics() {
+        // Mirrors what `load_bundled` does with `RAW_CATALOG`: a broken bundled
+        // file must surface as `Err`, never panic and never silently yield a
+        // permissive/default catalog. `bundled()` maps this `Err` to `None`
+        // (fail-closed: no catalog entries resolve) and logs it, but never
+        // falls back to something permissive.
+        let result: Result<ProviderCatalog, toml::de::Error> = toml::from_str("not = [valid");
+        assert!(result.is_err());
+        let err = CatalogError::from(result.unwrap_err());
+        assert!(matches!(err, CatalogError::Parse(_)));
     }
 
     #[test]

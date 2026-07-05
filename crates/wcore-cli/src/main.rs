@@ -849,17 +849,24 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
     };
 
-    // F-062: install signal handlers (SIGTERM / SIGINT / SIGHUP) that
-    // remove the crash sentinel before exit so the next restart does NOT
-    // falsely report a crash. Without these handlers, SIGTERM from the OS
-    // (e.g. `kill`, systemd, launchd) bypasses Drop and leaves the flag
-    // behind, causing every restart to claim the prior run crashed.
+    // F-062 / HF-1: install signal handlers (SIGTERM / SIGINT / SIGHUP) that
+    // perform a bounded, cooperative shutdown before exit — stopping tracked
+    // child processes cleanly and removing the crash sentinel — so the next
+    // restart does NOT falsely report a crash and browser sidecars aren't
+    // left as orphans. Without these handlers, SIGTERM from the OS (e.g.
+    // `kill`, systemd, launchd) bypasses Drop entirely (so `kill_on_drop` on
+    // any live child never fires) and leaves the sentinel flag behind,
+    // causing every restart to claim the prior run crashed.
     //
     // Implementation: spawn a background task that waits for any of the
-    // three signals, removes the sentinel file best-effort, and calls
-    // std::process::exit(0). The tokio runtime is shut down by exit() so
-    // all other tasks are cancelled; the sentinel file removal is the
-    // only ordering-critical step.
+    // three signals, then — bounded by `SHUTDOWN_GRACE_PERIOD` so a wedged
+    // lock can't hang the exit path indefinitely — kills every tracked
+    // browser sidecar child, removes the sentinel file best-effort, and
+    // finally calls std::process::exit(0). The tokio runtime is shut down by
+    // exit() so all other tasks are cancelled; this handler is what performs
+    // the equivalent of the graceful cleanup a normal (non-signal) exit gets
+    // via `mgr.shutdown()` / Drop guards, since exit() itself skips those.
+    const SHUTDOWN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
     #[cfg(unix)]
     {
         let sentinel_path_for_sig = wcore_cli::crash_sentinel::CrashSentinel::default_path();
@@ -873,6 +880,12 @@ async fn run() -> anyhow::Result<ExitCode> {
                 _ = int.recv()  => {}
                 _ = hup.recv()  => {}
             }
+            tracing::warn!("shutdown signal received; stopping child processes cooperatively");
+            let _ = tokio::time::timeout(
+                SHUTDOWN_GRACE_PERIOD,
+                tokio::task::spawn_blocking(wcore_browser::kill_all_children),
+            )
+            .await;
             // Best-effort: remove the sentinel so the next restart
             // doesn't falsely report a crash.
             let _ = std::fs::remove_file(&sentinel_path_for_sig);
@@ -894,6 +907,12 @@ async fn run() -> anyhow::Result<ExitCode> {
             // and CTRL_BREAK_EVENT). This is what the Electron wrapper sends
             // before a hard kill.
             let _ = tokio::signal::ctrl_c().await;
+            tracing::warn!("shutdown signal received; stopping child processes cooperatively");
+            let _ = tokio::time::timeout(
+                SHUTDOWN_GRACE_PERIOD,
+                tokio::task::spawn_blocking(wcore_browser::kill_all_children),
+            )
+            .await;
             let _ = std::fs::remove_file(&sentinel_path_for_sig);
             std::process::exit(0);
         });

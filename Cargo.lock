@@ -9542,6 +9542,7 @@ dependencies = [
  "wcore-acp",
  "wcore-agent",
  "wcore-agents-pack",
+ "wcore-browser",
  "wcore-budget",
  "wcore-channels-registry",
  "wcore-compact",
