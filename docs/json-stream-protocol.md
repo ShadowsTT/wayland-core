@@ -490,6 +490,7 @@ Dynamically inject an MCP server before the conversation starts. This command is
 | `env` | object | no | Environment variables for the subprocess |
 | `url` | string | sse/http only | Server URL |
 | `headers` | object | no | HTTP headers (for sse/http) |
+| `only_for_assistant` | string[] | no | #614 — allow-list of assistant names. Omitted/empty ⇒ global (connects regardless of the session's active assistant, today's behavior). Non-empty ⇒ the server is connected only when it matches the active assistant passed to `--assistant`; otherwise the add is rejected with an error and the server is never connected (fail-closed, same rule as config-declared `only_for_assistant` servers) |
 
 **Lifecycle:**
 

@@ -47,6 +47,8 @@ pub enum PathValidationError {
     Traversal(PathBuf),
     #[error("path targets a denied system location: {0:?}")]
     SystemPath(PathBuf),
+    #[error("path targets a Windows network share (UNC): {0:?}")]
+    NetworkPath(PathBuf),
 }
 
 /// Validate an LLM-supplied path before any filesystem touch.
@@ -64,6 +66,20 @@ pub fn validate_user_path(path: &Path) -> Result<PathBuf, PathValidationError> {
 
     if !path.is_absolute() {
         return Err(PathValidationError::NotAbsolute(raw));
+    }
+
+    // #644: a Windows UNC / network path (`\\server\share\x`) is absolute per
+    // `Path::is_absolute` and was passing straight through. Merely opening one
+    // triggers an outbound SMB connect — a NetNTLM-hash leak vector — and it is
+    // never a legitimate local file for the Read/Write/Edit tools. Reject
+    // before any I/O. No-op on Unix (paths there carry no UNC prefix). Mirrors
+    // `vision_tools::is_network_path`, now enforced once for every caller of
+    // this validator instead of only the vision path.
+    if matches!(
+        path.components().next(),
+        Some(Component::Prefix(p)) if matches!(p.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
+    ) {
+        return Err(PathValidationError::NetworkPath(raw));
     }
 
     // Traversal segments — string-form check matches `validate_memory_path`'s
@@ -679,6 +695,24 @@ mod tests {
     fn windows_ordinary_path_allowed() {
         let p = validate_user_path(Path::new(r"C:\work\notes.txt")).unwrap();
         assert_eq!(p, PathBuf::from(r"C:\work\notes.txt"));
+    }
+
+    // #644: a UNC / network path must be refused before any I/O — opening one
+    // triggers an outbound SMB connect (NetNTLM-hash leak). Gated to windows:
+    // `\\server\share\x` only parses as a `Prefix::UNC` component there; on
+    // Unix it's just a normal (non-absolute) path segment.
+    #[cfg(windows)]
+    #[test]
+    fn windows_unc_path_rejected() {
+        let err = validate_user_path(Path::new(r"\\server\share\notes.txt")).unwrap_err();
+        assert!(matches!(err, PathValidationError::NetworkPath(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_unc_path_rejected() {
+        let err = validate_user_path(Path::new(r"\\?\UNC\server\share\notes.txt")).unwrap_err();
+        assert!(matches!(err, PathValidationError::NetworkPath(_)));
     }
 
     // Companion: a symlink to a benign file is still allowed (no

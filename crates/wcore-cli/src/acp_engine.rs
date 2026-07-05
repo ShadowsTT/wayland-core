@@ -555,6 +555,13 @@ pub struct EngineSession {
     /// Tool names the engine registered, captured at build time for the A2A
     /// capability catalog.
     tool_names: Vec<String>,
+    /// #569 — this session's own consent doorbell (from
+    /// `BootstrapResult::egress_doorbell`), scoped onto the turn's task in
+    /// `run_turn` so an `Ask` raised while THIS session's turn runs rings
+    /// THIS bridge, not whichever session's bootstrap most recently rebound
+    /// the shared process-global egress policy slot. `None` when no egress
+    /// policy is installed (headless/tests).
+    egress_doorbell: Option<Arc<dyn wcore_agent::egress::ConsentDoorbell>>,
 }
 
 impl EngineSession {
@@ -566,6 +573,7 @@ impl EngineSession {
         engine: AgentEngine,
         approval_manager: Arc<ToolApprovalManager>,
         relay: RelayHandle,
+        egress_doorbell: Option<Arc<dyn wcore_agent::egress::ConsentDoorbell>>,
     ) -> Self {
         let tool_names = engine.tools().tool_names();
         let approval_bridge = engine.approval_bridge().clone();
@@ -575,6 +583,7 @@ impl EngineSession {
             approval_bridge,
             relay,
             tool_names,
+            egress_doorbell,
         }
     }
 
@@ -603,6 +612,12 @@ impl EngineSession {
         let engine = self.engine.clone();
         let relay = self.relay.clone();
         let turn_cancel = CancellationToken::new();
+        // #569 — scope THIS session's consent doorbell onto the task driving
+        // this turn, so an `Ask` raised by `guard.run` below (e.g. a provider
+        // or tool egress check) rings this session's bridge rather than
+        // whichever session's bootstrap most recently rebound the shared
+        // process-global egress policy slot.
+        let doorbell = self.egress_doorbell.clone();
 
         tokio::spawn(async move {
             // Guarantee a terminal event even on panic/abort.
@@ -614,7 +629,9 @@ impl EngineSession {
             // and the `run()` it scopes are both under the same lock.
             *relay.lock().unwrap() = Some(tx.clone());
             guard.set_cancel_token(turn_cancel.clone());
-            match guard.run(&text, &msg_id).await {
+            let run_result =
+                wcore_agent::egress::with_doorbell(doorbell, guard.run(&text, &msg_id)).await;
+            match run_result {
                 Ok(result) => {
                     if result.finish_reason == FinishReason::Error {
                         // FerroxLabs/wayland#200: a turn can end Ok with finish_reason=Error when
@@ -814,7 +831,12 @@ impl EngineTurnEngine {
         let bridge = engine.approval_bridge().clone();
         engine.set_protocol_writer(Arc::new(RelayEmitter::new(relay.clone(), Some(bridge))));
 
-        let session = Arc::new(EngineSession::new(engine, approval_manager, relay));
+        let session = Arc::new(EngineSession::new(
+            engine,
+            approval_manager,
+            relay,
+            result.egress_doorbell,
+        ));
 
         let mut pool = self.sessions.lock().await;
         // Another turn may have built the session concurrently; keep the
@@ -864,7 +886,7 @@ impl TurnEngine for EngineTurnEngine {
         // Map the transport-neutral wire scope onto the real protocol scope.
         // This is the only place the two vocabularies meet (wcore-acp has no
         // wcore-protocol dep by design).
-        let scope = match decision.scope {
+        let scope = match &decision.scope {
             wcore_acp::turn::ApprovalScopeWire::Once => {
                 wcore_protocol::commands::ApprovalScope::Once
             }
@@ -872,7 +894,9 @@ impl TurnEngine for EngineTurnEngine {
                 wcore_protocol::commands::ApprovalScope::Always
             }
             wcore_acp::turn::ApprovalScopeWire::AlwaysPrefix { prefix } => {
-                wcore_protocol::commands::ApprovalScope::AlwaysPrefix { prefix }
+                wcore_protocol::commands::ApprovalScope::AlwaysPrefix {
+                    prefix: prefix.clone(),
+                }
             }
         };
 
@@ -881,13 +905,26 @@ impl TurnEngine for EngineTurnEngine {
         // resolvable ONLY through the bridge; a manager-gated tool carries no
         // secret and resolves by `call_id`. When the host presents a non-empty
         // token, try the bridge first; fall through to the manager path if it
-        // is not a live bridge token (stale, or actually a manager gate). The
-        // ACP resolve carries no `modifications` payload (its `answer` threads
-        // to the manager path), so bridge consent is a plain approve/deny.
+        // is not a live bridge token (stale, or actually a manager gate).
+        //
+        // #583: thread the wire `scope` into the bridge outcome's
+        // `modifications` too. `BridgeConsentDoorbell` (egress consent) reads
+        // `modifications.egress_scope` to decide Once vs Always; without this
+        // an ACP host requesting Always for an egress consent silently got
+        // Once (safe, but the host was never told of the downgrade). Crucible
+        // council resolves approve/deny only and ignores `modifications`, so
+        // this is a no-op there.
         if let Some(token) = decision.resume_token.as_deref().filter(|t| !t.is_empty()) {
+            let modifications = match &decision.scope {
+                wcore_acp::turn::ApprovalScopeWire::Once => None,
+                wcore_acp::turn::ApprovalScopeWire::Always
+                | wcore_acp::turn::ApprovalScopeWire::AlwaysPrefix { .. } => {
+                    Some(serde_json::json!({ "egress_scope": "always" }))
+                }
+            };
             let outcome = wcore_agent::approval::ApprovalOutcome {
                 approved: decision.approved,
-                modifications: None,
+                modifications,
             };
             if session.approval_bridge.resolve(token, outcome).await {
                 return Ok(());
@@ -1486,7 +1523,7 @@ mod tests {
         let approval_manager = Arc::new(ToolApprovalManager::new());
         let output: Arc<dyn OutputSink> = Arc::new(RelaySink::new(relay.clone()));
         let engine = AgentEngine::new(placeholder_config(), ToolRegistry::new(), output);
-        Arc::new(EngineSession::new(engine, approval_manager, relay))
+        Arc::new(EngineSession::new(engine, approval_manager, relay, None))
     }
 
     /// A plain "approve once" decision (manager path — no bridge secret).
@@ -1545,6 +1582,55 @@ mod tests {
             .try_recv()
             .expect("approved outcome delivered to the bridge waiter");
         assert!(outcome.approved, "the bridge waiter sees the approval");
+    }
+
+    /// (#583) An Always-scoped bridge resolve carries `modifications.egress_scope
+    /// = "always"` to the bridge waiter, so `BridgeConsentDoorbell` can honor
+    /// Always instead of silently collapsing an ACP host's request to Once.
+    #[tokio::test]
+    async fn resolve_bridge_gate_always_scope_sets_egress_modifications() {
+        let turn = EngineTurnEngine::new(placeholder_config(), ".".to_string());
+        let session = live_session();
+        turn.sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), session.clone());
+
+        let (secret, mut rx) = session
+            .approval_bridge
+            .request_with_id(
+                "corr-1".to_string(),
+                wcore_agent::approval::ApprovalRequest {
+                    call_id: "corr-1".to_string(),
+                    reason: "egress consent".to_string(),
+                    context: String::new(),
+                },
+            )
+            .await;
+
+        let decision = ApprovalDecision {
+            approved: true,
+            scope: ApprovalScopeWire::Always,
+            answer: None,
+            resume_token: Some(secret),
+        };
+        turn.resolve_approval("s1", "corr-1", decision)
+            .await
+            .expect("bridge gate resolves via secret resume_token");
+
+        let outcome = rx
+            .try_recv()
+            .expect("approved outcome delivered to the bridge waiter");
+        assert!(outcome.approved);
+        assert_eq!(
+            outcome
+                .modifications
+                .as_ref()
+                .and_then(|v| v.get("egress_scope"))
+                .and_then(|s| s.as_str()),
+            Some("always"),
+            "Always scope must be threaded into modifications.egress_scope",
+        );
     }
 
     /// (#568 C) A stale/unknown resume_token does NOT resolve via the bridge and

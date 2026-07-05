@@ -108,6 +108,15 @@ pub struct BootstrapResult {
     /// command). They never reached connect_all/health(), so they are
     /// carried here so the boot snapshot can render a skipped (⊘) row.
     pub skipped_mcp_servers: Vec<(String, String)>,
+    /// #569 — this session's consent doorbell (the same instance handed to
+    /// the process-global egress policy below, if one is installed). `None`
+    /// when no egress policy is installed (headless/tests). A caller driving
+    /// multiple concurrent sessions (the ACP engine) should scope this onto
+    /// the task running the session's turn via
+    /// [`crate::egress::with_doorbell`], so that session's `Ask` prompts ring
+    /// THIS doorbell instead of whichever session's bootstrap last rebound
+    /// the shared policy slot.
+    pub egress_doorbell: Option<Arc<dyn crate::egress::ConsentDoorbell>>,
 }
 
 /// Wave OL: plugin-provider router. Called after plugin discovery + init
@@ -703,11 +712,26 @@ impl AgentBootstrap {
         let host_send_bridge =
             std::sync::Arc::new(crate::host_send_transport::HostSendBridge::new());
         if crate::host_send_transport::host_delegated_send_enabled() {
+            // wayland#585 (#574 follow-up): `without_channels(true)` is set
+            // ONLY by `ChannelTurnDispatcher` when it builds one of its
+            // isolated per-session engines — the ones whose entire lifetime
+            // is autonomous, inbound-channel-triggered turns (see
+            // `channel_dispatch.rs`). Gate THOSE engines' host-delegated
+            // `send_message` calls through the same per-conversation
+            // ping-pong limiter `run_turn` uses on its return-value reply
+            // path, closing the bypass where a tool-driven send during the
+            // turn skipped the limiter entirely. An interactive/human-driven
+            // engine (`without_channels == false`) keeps the limiter
+            // disabled — human/operator sends must never be throttled.
+            let mut transport = crate::host_send_transport::HostDelegatedTransport::new(
+                host_send_bridge.clone(),
+                self.output.clone(),
+            );
+            if self.without_channels {
+                transport = transport.autonomous();
+            }
             registry.register(Box::new(wcore_tools::send_message::SendMessageTool::new(
-                std::sync::Arc::new(crate::host_send_transport::HostDelegatedTransport::new(
-                    host_send_bridge.clone(),
-                    self.output.clone(),
-                )),
+                std::sync::Arc::new(transport),
             )));
             tracing::info!(
                 target: "wcore_agent::bootstrap",
@@ -1964,12 +1988,21 @@ impl AgentBootstrap {
         // security is off, so this is a cheap no-op there (no allocation, no
         // boot-cost — unlike the policy *install*, which is deliberately kept at
         // CLI entry, not here).
+        // #569 — keep this session's doorbell so it can also be carried out
+        // via `BootstrapResult::egress_doorbell` (see its doc comment): the
+        // shared `set_doorbell` below stays as the fallback for callers that
+        // never scope a doorbell onto their turn's task (single-session
+        // TUI/stdin), but a multi-session caller (the ACP engine) should
+        // prefer scoping THIS instance for the duration of this session's
+        // turns instead of relying on whichever session bootstrapped last.
+        let mut egress_doorbell: Option<Arc<dyn crate::egress::ConsentDoorbell>> = None;
         if let Some(policy) = crate::egress::installed_policy() {
             let doorbell = std::sync::Arc::new(crate::egress::BridgeConsentDoorbell::new(
                 approval_bridge.clone(),
                 self.output.clone(),
             ));
-            policy.set_doorbell(doorbell);
+            policy.set_doorbell(doorbell.clone());
+            egress_doorbell = Some(doorbell);
         }
 
         if self.config.builtin_tools.script.enabled {
@@ -2861,6 +2894,7 @@ impl AgentBootstrap {
             inbound_subscriber,
             inbound_webhook,
             skipped_mcp_servers,
+            egress_doorbell,
         })
     }
 }

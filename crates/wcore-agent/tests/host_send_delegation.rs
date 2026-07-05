@@ -178,6 +178,7 @@ async fn run_turn(h: &Harness, call: ContentBlock) -> ContentBlock {
         false,
         &tokio_util::sync::CancellationToken::new(),
         None,
+        &wcore_agent::output::protocol_sink::ActiveTokenRedactor::new(),
     )
     .await
     .expect("should not return ExecutionControl");

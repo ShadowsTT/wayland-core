@@ -947,6 +947,14 @@ pub async fn execute_tool_calls_with_approval(
     file_write_notifier: Option<
         &std::sync::Arc<dyn wcore_tools::file_write_notifier::FileWriteNotifier>,
     >,
+    // #584: the engine's `ApprovalBridge` redactor, threaded down so the
+    // authoritative `ToolResult` emitted below — the choke point every
+    // transport (ACP, TUI, json-stream) reads from — has in-flight approval
+    // correlation ids scrubbed before it leaves the process. Only the
+    // event's `output` copy is redacted; `result`/`results` (fed back into
+    // the LLM conversation) are left untouched, matching the existing
+    // streaming-chunk/Info redaction pattern in `ProtocolSink`.
+    redactor: &crate::output::protocol_sink::ActiveTokenRedactor,
 ) -> Result<ToolCallOutcome, ExecutionControl> {
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
@@ -1141,7 +1149,12 @@ pub async fn execute_tool_calls_with_approval(
                 call_id: id.clone(),
                 tool_name: name.clone(),
                 status,
-                output: content.clone(),
+                // #584: this is the authoritative tool-result card forwarded
+                // raw by every transport (ACP, TUI, json-stream) — redact
+                // in-flight approval correlation ids here, once, instead of
+                // per-transport. `result`/`results` (below) stay unredacted
+                // since that content still feeds the LLM's own context.
+                output: redactor.redact(content),
                 output_type: OutputType::Text,
                 metadata: None,
             });
@@ -1823,6 +1836,7 @@ mod tests {
             false,
             &tokio_util::sync::CancellationToken::new(),
             None,
+            &crate::output::protocol_sink::ActiveTokenRedactor::new(),
         )
         .await
         .expect("should not return ExecutionControl");
@@ -1887,6 +1901,7 @@ mod tests {
             false,
             &tokio_util::sync::CancellationToken::new(),
             None,
+            &crate::output::protocol_sink::ActiveTokenRedactor::new(),
         )
         .await
         .expect("should not return ExecutionControl");
@@ -1977,6 +1992,7 @@ mod tests {
                 false,
                 &tokio_util::sync::CancellationToken::new(),
                 None,
+                &crate::output::protocol_sink::ActiveTokenRedactor::new(),
             ),
         )
         .await
@@ -2022,6 +2038,120 @@ mod tests {
             })
             .collect();
         assert_eq!(result_ids, call_ids, "ToolResult ids must match in order");
+    }
+
+    // ---- #584: central ToolResult redaction ---------------------------------
+
+    /// A tool that echoes its `cmd` input straight back as output — stands in
+    /// for a tool that unwittingly leaks a live approval correlation id.
+    struct MockEchoTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MockEchoTool {
+        fn name(&self) -> &str {
+            "MockEcho"
+        }
+        fn description(&self) -> &str {
+            "Echoes its cmd input back as the tool result"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
+            })
+        }
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            true
+        }
+        async fn execute(&self, input: serde_json::Value) -> wcore_types::tool::ToolResult {
+            wcore_types::tool::ToolResult {
+                content: input
+                    .get("cmd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                is_error: false,
+            }
+        }
+        fn category(&self) -> wcore_protocol::events::ToolCategory {
+            wcore_protocol::events::ToolCategory::Exec
+        }
+    }
+
+    /// The choke-point fix: a tool that echoes a live approval token must
+    /// have that token scrubbed from the `ProtocolEvent::ToolResult.output`
+    /// forwarded to the transport, while the conversation-level
+    /// `ContentBlock::ToolResult.content` (fed back to the LLM) is left
+    /// untouched — matching the existing streaming-chunk/Info redaction
+    /// pattern in `ProtocolSink`.
+    #[tokio::test]
+    async fn tool_result_choke_point_redacts_live_token_in_emitted_output_only() {
+        use wcore_protocol::ToolApprovalManager;
+        use wcore_protocol::events::ProtocolEvent;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockEchoTool));
+        let mgr = Arc::new(ToolApprovalManager::new());
+        let emitter = Arc::new(CapturingEmitter(Mutex::new(Vec::new())));
+        let writer: Arc<dyn wcore_protocol::writer::ProtocolEmitter> =
+            Arc::clone(&emitter) as Arc<dyn wcore_protocol::writer::ProtocolEmitter>;
+
+        let live_token = "apr-live-secret-token";
+        let redactor = crate::output::protocol_sink::ActiveTokenRedactor::new();
+        redactor.set(vec![live_token.to_string()]);
+
+        let tool_call = ContentBlock::ToolUse {
+            id: "call-echo-1".into(),
+            name: "MockEcho".into(),
+            input: json!({"cmd": format!("leaked token: {live_token}")}),
+            extra: None,
+        };
+
+        let outcome = execute_tool_calls_with_approval(
+            &registry,
+            &[tool_call],
+            &mgr,
+            &writer,
+            "msg-echo",
+            true, // auto_approve: the tool dispatches without a gate
+            &[],
+            None,
+            wcore_compact::CompactionLevel::Off,
+            false,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+            &redactor,
+        )
+        .await
+        .expect("should not return ExecutionControl");
+
+        // Conversation-level content still carries the raw token — the LLM's
+        // own context is untouched by transport-facing redaction.
+        assert_eq!(outcome.results.len(), 1);
+        let ContentBlock::ToolResult { content, .. } = &outcome.results[0] else {
+            panic!("expected ToolResult");
+        };
+        assert!(
+            content.contains(live_token),
+            "conversation content must keep the raw token; got: {content}"
+        );
+
+        // The emitted ProtocolEvent::ToolResult — the authoritative card every
+        // transport reads from — must have the token scrubbed.
+        let events = emitter.0.lock().expect("emitter mutex").clone();
+        let emitted_output = events
+            .iter()
+            .find_map(|e| match e {
+                ProtocolEvent::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .expect("a ToolResult event must have been emitted");
+        assert!(
+            !emitted_output.contains(live_token),
+            "emitted ToolResult.output must not leak the live token; got: {emitted_output}"
+        );
+        assert!(emitted_output.contains("[REDACTED]"));
     }
 
     // ---- rank 58: dispatch timeout-cancel surfaces a cancelled id ----------

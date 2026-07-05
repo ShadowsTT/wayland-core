@@ -67,13 +67,18 @@ pub trait VirtualFs: Send + Sync {
     }
 }
 
-/// Minimum metadata surface tools need (size + is_dir). Avoids leaking
-/// `std::fs::Metadata` into the trait so InMemoryFs can be honest about
-/// its lack of filesystem-grade attributes.
+/// Minimum metadata surface tools need (size + is_dir + is_file). Avoids
+/// leaking `std::fs::Metadata` into the trait so InMemoryFs can be honest
+/// about its lack of filesystem-grade attributes.
 #[derive(Debug, Clone)]
 pub struct VfsMetadata {
     pub size: u64,
     pub is_dir: bool,
+    /// #644: true for a regular file. False for a directory AND for a
+    /// non-regular node (FIFO, char/block device, socket) — the latter is
+    /// what callers use to refuse a read that could hang or stream
+    /// unbounded bytes (e.g. `/dev/zero`, whose reported size lies as 0).
+    pub is_file: bool,
 }
 
 /// RealFs — passes through to `tokio::fs`.
@@ -116,6 +121,7 @@ impl VirtualFs for RealFs {
         Ok(VfsMetadata {
             size: m.len(),
             is_dir: m.is_dir(),
+            is_file: m.is_file(),
         })
     }
 }
@@ -179,6 +185,8 @@ impl VirtualFs for InMemoryFs {
         Ok(VfsMetadata {
             size: bytes.len() as u64,
             is_dir: false,
+            // In-memory entries are plain byte buffers — never a special file.
+            is_file: true,
         })
     }
 }

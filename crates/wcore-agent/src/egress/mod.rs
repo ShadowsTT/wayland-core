@@ -11,6 +11,7 @@ pub mod consent;
 pub mod defaults;
 pub mod install;
 pub mod policy;
+pub mod session_scope;
 
 pub use bridge_doorbell::BridgeConsentDoorbell;
 pub use classify::{AllowList, EgressVerdict, classify};
@@ -18,3 +19,4 @@ pub use consent::{ConsentDecision, ConsentDoorbell};
 pub use defaults::build_allowlist;
 pub use install::install_egress_policy;
 pub use policy::{AgentEgressPolicy, EgressPosture, installed_policy};
+pub use session_scope::with_doorbell;

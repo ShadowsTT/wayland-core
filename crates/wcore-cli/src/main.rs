@@ -2461,6 +2461,7 @@ fn mcp_failed_events_for(mgr: &McpManager) -> Vec<ProtocolEvent> {
 /// the registry is momentarily borrowed so the caller can retry between
 /// turns); on failure, surface the error with bootstrap's inline-connect
 /// wording. Shared by the loop-top non-blocking poll and the select arm.
+#[allow(clippy::too_many_arguments)]
 fn note_deferred_mcp_connect(
     outcome: Result<McpManager, wcore_mcp::transport::McpError>,
     resolved: HashMap<String, McpServerConfig>,
@@ -2468,11 +2469,21 @@ fn note_deferred_mcp_connect(
     writer: &ProtocolWriter,
     output: &Arc<dyn OutputSink>,
     dynamic_managers: &mut Vec<Arc<McpManager>>,
+    boot_managers: &[Arc<McpManager>],
+    hooks_dispatch_enabled: bool,
 ) -> Option<(Arc<McpManager>, HashMap<String, McpServerConfig>)> {
     match outcome {
         Ok(mgr) => {
             let mgr = Arc::new(mgr);
-            if integrate_deferred_mcp(engine, mgr.clone(), &resolved, writer, dynamic_managers) {
+            if integrate_deferred_mcp(
+                engine,
+                mgr.clone(),
+                &resolved,
+                writer,
+                dynamic_managers,
+                boot_managers,
+                hooks_dispatch_enabled,
+            ) {
                 None
             } else {
                 Some((mgr, resolved))
@@ -2488,12 +2499,15 @@ fn note_deferred_mcp_connect(
 /// Returns `false` when the registry Arc is currently borrowed (a turn is
 /// mid-flight) — the caller parks the manager and retries at the next
 /// between-turns boundary.
+#[allow(clippy::too_many_arguments)]
 fn integrate_deferred_mcp(
     engine: &mut wcore_agent::engine::AgentEngine,
     mgr: Arc<McpManager>,
     resolved_servers: &HashMap<String, McpServerConfig>,
     writer: &ProtocolWriter,
     dynamic_managers: &mut Vec<Arc<McpManager>>,
+    boot_managers: &[Arc<McpManager>],
+    hooks_dispatch_enabled: bool,
 ) -> bool {
     let builtin_names = engine.tool_names();
     let Some(reg) = engine.registry_mut() else {
@@ -2507,7 +2521,87 @@ fn integrate_deferred_mcp(
         let _ = writer.emit(&event);
     }
     dynamic_managers.push(mgr);
+    // wayland#562 — a deferred config-MCP server may host the MCP tool a
+    // plugin's lifecycle hook resolves to. Boot-time binding
+    // (`AgentBootstrap::build`) only sees managers connected before
+    // `defer_config_mcp` skipped this one, so re-resolve now that it is
+    // live. No-op (existing binding, if any, is left untouched) unless
+    // resolution finds a NEW single-server match.
+    maybe_rebind_hook_dispatcher(
+        engine,
+        boot_managers,
+        dynamic_managers,
+        hooks_dispatch_enabled,
+    );
     true
+}
+
+/// wayland#562 — re-resolve the plugin-hook -> MCP-server binding against
+/// every currently connected manager (boot-time + background-connected so
+/// far) and rebind the engine's `HookDispatcher` when resolution finds a
+/// binding. Mirrors `AgentBootstrap::build`'s boot-time binding (see
+/// bootstrap.rs), but reads the registered plugin hooks straight off the
+/// live `HookEngine` since no bootstrap-local state survives past
+/// `build()`. A no-op when hook dispatch is disabled, no plugin registered
+/// a hook, or resolution stays empty.
+fn maybe_rebind_hook_dispatcher(
+    engine: &mut wcore_agent::engine::AgentEngine,
+    boot_managers: &[Arc<McpManager>],
+    dynamic_managers: &[Arc<McpManager>],
+    hooks_dispatch_enabled: bool,
+) {
+    if !hooks_dispatch_enabled {
+        return;
+    }
+    // Clone the (plugin, hook name) pairs out of the `HookEngine` up front so
+    // the immutable borrow of `engine` ends here — `set_hook_dispatcher`
+    // below needs `&mut engine`.
+    let hook_pairs: Vec<(String, String)> = match engine.hook_engine() {
+        Some(hook_engine) => hook_engine
+            .plugin_hooks()
+            .iter()
+            .map(|h| (h.plugin.clone(), h.name.clone()))
+            .collect(),
+        None => return,
+    };
+    if hook_pairs.is_empty() {
+        return;
+    }
+    let mut hooks_by_plugin: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (plugin, name) in &hook_pairs {
+        hooks_by_plugin
+            .entry(plugin.as_str())
+            .or_default()
+            .push(name.as_str());
+    }
+    let all_managers: Vec<Arc<McpManager>> = boot_managers
+        .iter()
+        .chain(dynamic_managers.iter())
+        .cloned()
+        .collect();
+    let mut servers: HashMap<String, Vec<String>> = HashMap::new();
+    for mgr in &all_managers {
+        for (server_name, tool) in mgr.all_tools() {
+            servers
+                .entry(server_name.to_string())
+                .or_default()
+                .push(tool.name.to_string());
+        }
+    }
+    let servers_view: Vec<(&str, Vec<&str>)> = servers
+        .iter()
+        .map(|(s, tools)| (s.as_str(), tools.iter().map(String::as_str).collect()))
+        .collect();
+    let server_for_plugin =
+        wcore_agent::hooks::resolve_server_for_plugin(&hooks_by_plugin, &servers_view);
+    if server_for_plugin.is_empty() {
+        return;
+    }
+    let caller = Arc::new(wcore_agent::hooks::McpManagerCaller::new(all_managers));
+    engine.set_hook_dispatcher(Arc::new(wcore_agent::hooks::McpHookDispatcher::new(
+        caller,
+        server_for_plugin,
+    )));
 }
 
 fn to_mcp_server_config(
@@ -2517,6 +2611,7 @@ fn to_mcp_server_config(
     env: Option<HashMap<String, String>>,
     url: Option<String>,
     headers: Option<HashMap<String, String>>,
+    only_for_assistant: Option<Vec<String>>,
 ) -> Result<McpServerConfig, String> {
     let transport_type = match transport {
         "stdio" => TransportType::Stdio,
@@ -2533,7 +2628,7 @@ fn to_mcp_server_config(
         headers,
         deferred: Some(false),
         allow_local: false,
-        only_for_assistant: None,
+        only_for_assistant,
     })
 }
 
@@ -2755,6 +2850,11 @@ async fn run_json_stream_mode(
         })
     };
 
+    // wayland#562 — captured before `config` moves into `AgentBootstrap::new`
+    // below; needed later to gate `maybe_rebind_hook_dispatcher` once a
+    // deferred config-MCP server connects in the background.
+    let hooks_dispatch_enabled = config.hooks.dispatch_enabled;
+
     // Bootstrap engine with full feature initialization. Phase 1B-2 —
     // json-stream is a primary long-running host session (e.g. the Wayland
     // desktop app), so
@@ -2925,6 +3025,8 @@ async fn run_json_stream_mode(
                         &writer,
                         &output,
                         &mut dynamic_managers,
+                        &result.mcp_managers,
+                        hooks_dispatch_enabled,
                     );
                 }
                 continue;
@@ -2939,16 +3041,28 @@ async fn run_json_stream_mode(
                 env,
                 url,
                 headers,
+                only_for_assistant,
             } => {
                 eprintln!(
                     "[mcp] AddMcpServer received: name={name}, transport={transport}, command={command:?}"
                 );
-                // #135: idempotency — re-adding an already-connected server (boot
-                // set or a prior dynamic add) does not spawn a duplicate. Re-emit
-                // the existing tools so the host's view stays consistent, then skip
-                // the reconnect. NOTE: a re-add with changed config is ignored (the
-                // existing connection is kept) — remove then add to reconfigure.
-                if engine.mcp_server_connected(&name) {
+                // #135 + #605 (follow-up 1): idempotency — re-adding an
+                // already-connected server (boot set or a prior dynamic add)
+                // does not spawn a duplicate. `engine.mcp_server_connected`
+                // keys on registered TOOL provenance, so a server that
+                // exposes only resources/prompts (zero tools) is invisible
+                // to it — a re-add would still reconnect (duplicate stdio
+                // child). Also probe the live MCP manager registries
+                // (`hosts_server`, keyed on the connected server name, not
+                // its tools) to catch that case. Re-emit the existing tools
+                // (empty for a resource-only server) so the host's view
+                // stays consistent, then skip the reconnect. NOTE: a re-add
+                // with changed config is ignored (the existing connection
+                // is kept) — remove then add to reconfigure.
+                let already_connected = engine.mcp_server_connected(&name)
+                    || result.mcp_managers.iter().any(|m| m.hosts_server(&name))
+                    || dynamic_managers.iter().any(|m| m.hosts_server(&name));
+                if already_connected {
                     let existing: Vec<String> = engine
                         .tools()
                         .to_tool_defs()
@@ -2967,14 +3081,38 @@ async fn run_json_stream_mode(
                     });
                     continue;
                 }
-                let config =
-                    match to_mcp_server_config(&transport, command, args, env, url, headers) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            output.emit_error(&format!("AddMcpServer '{name}': {e}"), false);
-                            continue;
-                        }
-                    };
+                let config = match to_mcp_server_config(
+                    &transport,
+                    command,
+                    args,
+                    env,
+                    url,
+                    headers,
+                    only_for_assistant,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        output.emit_error(&format!("AddMcpServer '{name}': {e}"), false);
+                        continue;
+                    }
+                };
+                // #614 — extend the #111 per-assistant scoping fail-closed
+                // gate to the runtime-added path: a server marked
+                // `only_for_assistant` is connected only when it matches the
+                // session's active assistant (same rule as the config-declared
+                // choke points in bootstrap.rs). Unmarked servers are
+                // unaffected (today's behavior).
+                if !config.is_visible_to_assistant(assistant.as_deref()) {
+                    eprintln!(
+                        "[mcp] '{name}' not added: scoped to {:?}, active assistant is {:?}",
+                        config.only_for_assistant, assistant
+                    );
+                    output.emit_error(
+                        &format!("AddMcpServer '{name}': not visible to the active assistant"),
+                        false,
+                    );
+                    continue;
+                }
 
                 let mut single_configs = HashMap::new();
                 single_configs.insert(name.clone(), config.clone());
@@ -3066,6 +3204,8 @@ async fn run_json_stream_mode(
                 &writer,
                 &output,
                 &mut dynamic_managers,
+                &result.mcp_managers,
+                hooks_dispatch_enabled,
             );
         }
         if let Some((mgr, resolved)) = pending_deferred_mcp.take()
@@ -3075,6 +3215,8 @@ async fn run_json_stream_mode(
                 &resolved,
                 &writer,
                 &mut dynamic_managers,
+                &result.mcp_managers,
+                hooks_dispatch_enabled,
             )
         {
             pending_deferred_mcp = Some((mgr, resolved));
@@ -3107,6 +3249,8 @@ async fn run_json_stream_mode(
                                 &writer,
                                 &output,
                                 &mut dynamic_managers,
+                                &result.mcp_managers,
+                                hooks_dispatch_enabled,
                             );
                         }
                     }
@@ -3118,7 +3262,7 @@ async fn run_json_stream_mode(
             ProtocolCommand::Message {
                 msg_id,
                 content,
-                files: _,
+                files,
             } => {
                 // F-079: thread the active turn id into the protocol sink so
                 // any emit_info calls during this turn carry the right msg_id
@@ -3180,6 +3324,45 @@ async fn run_json_stream_mode(
                 let mut stopped = false;
                 let mut pending_config: Option<PendingConfig> = None;
                 let mut mode_changed = false;
+
+                // #648: a composer-dropped local image arrives as a plain
+                // path in `files[]` — nothing upstream turns that into a
+                // vision block. Resolve each entry through the same
+                // hardened local-file reader `vision_analyze` uses (#170:
+                // validate_user_path + UNC reject + TOCTOU-safe open-once +
+                // size/MIME checks) and queue any that resolve as a native
+                // `ContentBlock::Image` for this turn. Non-image / unreadable
+                // entries are skipped — same as before this change, which
+                // dropped `files` entirely — so a plain attachment or a
+                // rejected path never blocks the turn.
+                if !files.is_empty() {
+                    let mut image_blocks = Vec::with_capacity(files.len());
+                    for path in &files {
+                        match wcore_tools::vision_tools::VisionAnalyzeTool::default()
+                            .resolve_source(path)
+                            .await
+                        {
+                            Ok((mime, bytes)) => {
+                                use base64::Engine as _;
+                                image_blocks.push(wcore_types::message::ContentBlock::Image {
+                                    mime: mime.to_string(),
+                                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                                });
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    target: "wcore_cli::message",
+                                    path = %path,
+                                    error = %error,
+                                    "composer file not attached as an image"
+                                );
+                            }
+                        }
+                    }
+                    if !image_blocks.is_empty() {
+                        engine.queue_image_blocks(image_blocks);
+                    }
+                }
 
                 {
                     let engine_fut = engine.run(&content, &msg_id);
@@ -3792,7 +3975,9 @@ mod tests {
                 mgr,
                 &HashMap::new(),
                 &writer,
-                &mut dynamic_managers
+                &mut dynamic_managers,
+                &[],
+                false,
             ),
             "integration must succeed on an idle engine"
         );
@@ -3829,7 +4014,9 @@ mod tests {
                 mgr,
                 &HashMap::new(),
                 &writer,
-                &mut dynamic_managers
+                &mut dynamic_managers,
+                &[],
+                false,
             ),
             "integration must decline while the registry is borrowed"
         );
@@ -3839,6 +4026,83 @@ mod tests {
             "no tools may be registered on a declined integration"
         );
         drop(hold);
+    }
+
+    /// wayland#562: a plugin hook that resolves only to a config-declared MCP
+    /// server must still bind once that server finishes connecting in the
+    /// background (`defer_config_mcp`) — the boot-time binding in
+    /// `AgentBootstrap::build` never sees a deferred server, so pre-fix the
+    /// hook stayed log-only for the entire session. Proven end-to-end: fire
+    /// `SessionStart` after `integrate_deferred_mcp` and observe the newly
+    /// bound server's tool contribution land in `injected_messages`.
+    #[tokio::test]
+    async fn integrate_deferred_mcp_rebinds_plugin_hook_to_new_server() {
+        struct HookEchoTransport;
+        #[async_trait]
+        impl McpTransport for HookEchoTransport {
+            async fn request(&self, _req: &JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: Some(1),
+                    result: Some(json!({
+                        "content": [{"type": "text", "text": "hook contribution"}]
+                    })),
+                    error: None,
+                })
+            }
+            async fn notify(&self, _req: &JsonRpcRequest) -> Result<(), McpError> {
+                Ok(())
+            }
+            async fn close(&self) -> Result<(), McpError> {
+                Ok(())
+            }
+        }
+
+        let (mut engine, _sink) = wcore_agent::bootstrap::AgentBootstrap::build_for_test(
+            wcore_config::config::Config::default(),
+            vec![],
+        );
+        engine.register_plugin_hooks(vec![wcore_agent::plugins::runner::PluginHook {
+            plugin: "acme".to_string(),
+            phase: wcore_plugin_api::registry::hooks::HookPhase::SessionStart,
+            name: "acme_session_start".to_string(),
+        }]);
+
+        let mgr = Arc::new(McpManager::new_for_test_with_tools(vec![(
+            "acme_server",
+            false,
+            Box::new(HookEchoTransport) as Box<dyn McpTransport>,
+            vec![tool("acme_session_start")],
+        )]));
+        let writer = ProtocolWriter::new();
+        let mut dynamic_managers = Vec::new();
+        assert!(
+            integrate_deferred_mcp(
+                &mut engine,
+                mgr,
+                &HashMap::new(),
+                &writer,
+                &mut dynamic_managers,
+                &[],
+                true,
+            ),
+            "integration must succeed on an idle engine"
+        );
+
+        let outcome = engine
+            .hook_engine()
+            .expect("build_for_test always installs a HookEngine")
+            .run_session_start()
+            .await;
+        assert!(
+            outcome
+                .injected_messages
+                .iter()
+                .any(|m| format!("{m:?}").contains("hook contribution")),
+            "the deferred server's tool must be reachable via the rebound dispatcher; \
+             injected_messages = {:?}",
+            outcome.injected_messages
+        );
     }
 
     /// Rank 47 regression: `--no-memory` must parse and flip

@@ -150,6 +150,21 @@ fn allows_echo_of_plain_text() {
 }
 
 #[test]
+fn allows_powershell_env_reads_of_non_secrets() {
+    // #618: `\$env:[A-Z_]` used to match *any* PowerShell env read, so
+    // ordinary Windows commands like `$env:PATH` were refused outright,
+    // leaving Bash unusable there. Only credential-suffixed names
+    // (`*_API_KEY|SECRET|TOKEN|PASSWORD|PASSWD`) should be denied.
+    assert_allowed("$env:PATH");
+    assert_allowed("$env:USERPROFILE");
+    assert_allowed("$env:HOME");
+    assert_allowed("Write-Host $env:PATH");
+    // Named-secret PowerShell reads must still be refused.
+    assert_refused("$env:OPENAI_API_KEY");
+    assert_refused("$env:AWS_SECRET_ACCESS_KEY");
+}
+
+#[test]
 fn allows_commands_that_mention_env_substring_but_arent_env_dumps() {
     // `envoy` starts with `env` but is a distinct command.
     assert_allowed("envoy --version");

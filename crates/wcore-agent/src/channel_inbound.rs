@@ -81,6 +81,14 @@ const MAX_SESSION_WORKERS: usize = 1000;
 /// per-key engine pool — so a later message simply respawns a fresh worker.
 const WORKER_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// wayland#585: one-time-per-episode channel notice sent when the
+/// per-conversation auto-reply rate limit ([`wcore_channels::AutoReplyRateLimiter`])
+/// suppresses a reply, so a human on an interactive channel is never left
+/// silently staring at a stopped agent. Content-free (no message text, no
+/// counts) — only that autonomous replies are paused.
+const AUTO_REPLY_RATE_LIMIT_NOTICE: &str =
+    "Auto-replies are rate-limited for this conversation right now; pausing until it cools down.";
+
 /// Pick the outbound reply target for a turn's reply.
 ///
 /// Prefers `reply_to_message_id` — the specific message the inbound quoted,
@@ -547,11 +555,15 @@ async fn run_turn(
             // before any `.await` (bounded map op only — never held across the
             // send); a poisoned mutex is recovered rather than panicking, since
             // the critical section cannot itself panic.
-            let allowed = {
+            let (allowed, notice_due) = {
                 let mut limiter = rate_limiter
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                limiter.check_and_record(session_key, std::time::Instant::now())
+                let allowed = limiter.check_and_record(session_key, std::time::Instant::now());
+                // Only relevant when suppressed; still bounded map ops, no
+                // extra lock acquisition.
+                let notice_due = !allowed && limiter.take_notice_due(session_key);
+                (allowed, notice_due)
             };
             if !allowed {
                 // Content-free: log only the session key, never message text.
@@ -560,6 +572,28 @@ async fn run_turn(
                     session_key = %session_key,
                     "autonomous reply suppressed: per-conversation rate limit hit (ping-pong guard)"
                 );
+                // wayland#585: a human on an interactive channel must not be
+                // left silently staring at a stopped agent. Surface a
+                // one-time-per-episode channel notice (bounded to at most one
+                // extra message per rate-limit window by `take_notice_due`)
+                // instead of dropping the reply with only an operator-visible
+                // log line.
+                if notice_due {
+                    let notice = OutgoingMessage {
+                        conversation_id: msg.conversation_id.clone(),
+                        text: AUTO_REPLY_RATE_LIMIT_NOTICE.to_string(),
+                        reply_to: outbound_reply_target(msg),
+                        attachments: Vec::new(),
+                    };
+                    let guard = manager.read().await;
+                    if let Err(e) = guard.send_to(channel_name, notice).await {
+                        tracing::warn!(
+                            channel = %channel_name,
+                            error = %e,
+                            "failed to send auto-reply rate-limit notice"
+                        );
+                    }
+                }
                 return;
             }
 
@@ -1202,6 +1236,11 @@ mod tests {
     /// is distinct (not a self-echo, not a duplicate) — the two-agent ping-pong
     /// case the self/bot loop guard and the Message-ID echo guard both miss.
     /// The turns still run; only the outbound SEND is throttled.
+    ///
+    /// wayland#585: the FIRST suppressed turn also emits a one-time
+    /// channel-side notice (distinct from the "pong" replies), so the two
+    /// admitted replies plus exactly one notice land — not more, even though
+    /// three turns are suppressed.
     #[tokio::test]
     async fn over_limit_autonomous_replies_are_suppressed() {
         let mut policies = HashMap::new();
@@ -1223,12 +1262,20 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 5);
 
         // Give any (incorrect) extra sends a chance to land, then assert the cap.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = wait_for_len(&outbound, 3, Duration::from_secs(3)).await;
         assert_eq!(
-            outbound.lock().await.len(),
-            2,
-            "autonomous sends capped at the per-conversation limit"
+            sent, 3,
+            "two admitted autonomous replies + exactly one rate-limit notice"
         );
+        let out = outbound.lock().await;
+        let notices = out
+            .iter()
+            .filter(|m| m.text == AUTO_REPLY_RATE_LIMIT_NOTICE)
+            .count();
+        assert_eq!(notices, 1, "the notice is sent exactly once per episode");
+        let pongs = out.iter().filter(|m| m.text == "pong").count();
+        assert_eq!(pongs, 2, "the two admitted replies are unaffected");
+        drop(out);
 
         manager.write().await.stop_all().await.unwrap();
         handle.abort();
@@ -1236,13 +1283,18 @@ mod tests {
 
     /// The rate limit is per-conversation: one conversation exhausting its quota
     /// must not throttle a different conversation.
+    ///
+    /// wayland#585: each conversation's suppressed second turn also emits its
+    /// own one-time notice, so each conversation contributes one "pong" +
+    /// one notice — four messages total, two per conversation.
     #[tokio::test]
     async fn rate_limit_is_per_conversation() {
         let mut policies = HashMap::new();
         policies.insert("slack".to_string(), open_dm_policy());
 
         // Two messages each for conversations "c1" and "c2", cap of 1 per
-        // conversation. Expect exactly one send per conversation = two total.
+        // conversation. Expect exactly one admitted send + one notice per
+        // conversation = four total.
         let mut q = VecDeque::new();
         q.push_back(dm_conv("a0", "c1"));
         q.push_back(dm_conv("b0", "c2"));
@@ -1256,12 +1308,23 @@ mod tests {
         assert_eq!(dispatched, 4, "all four turns run");
         assert_eq!(count.load(Ordering::SeqCst), 4);
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let sent = wait_for_len(&outbound, 4, Duration::from_secs(3)).await;
+        assert_eq!(sent, 4, "one admitted send + one notice per conversation");
         let out = outbound.lock().await;
-        assert_eq!(out.len(), 2, "one allowed send per conversation");
-        let mut convs: Vec<String> = out.iter().map(|m| m.conversation_id.clone()).collect();
+        let mut convs: Vec<String> = out
+            .iter()
+            .filter(|m| m.text == "pong")
+            .map(|m| m.conversation_id.clone())
+            .collect();
         convs.sort();
         assert_eq!(convs, vec!["c1".to_string(), "c2".to_string()]);
+        let mut notice_convs: Vec<String> = out
+            .iter()
+            .filter(|m| m.text == AUTO_REPLY_RATE_LIMIT_NOTICE)
+            .map(|m| m.conversation_id.clone())
+            .collect();
+        notice_convs.sort();
+        assert_eq!(notice_convs, vec!["c1".to_string(), "c2".to_string()]);
 
         drop(out);
         manager.write().await.stop_all().await.unwrap();

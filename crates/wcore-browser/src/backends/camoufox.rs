@@ -127,6 +127,30 @@ impl CamoufoxBackend {
             format!("{}/{}", self.base_url, path)
         }
     }
+
+    /// Turn a failed `POST /sessions` into an honest error.
+    ///
+    /// Camoufox is a sidecar the engine expects to already be listening at
+    /// `base_url` — nothing in this crate spawns it (`launch_camoufox` has
+    /// no non-test caller; see wayland#491 / wayland-core#113). A raw
+    /// connect-refused reqwest error ("error sending request for url
+    /// (...)") reads to an operator as an opaque network blip with no hint
+    /// that a whole separate process is expected to be running. Rewrite
+    /// connect failures into an actionable message; leave anything else
+    /// (timeout, TLS, DNS on a non-default `base_url`, ...) as-is.
+    fn session_open_error(&self, e: wcore_egress::EgressError) -> BrowserOpError {
+        if e.is_connect() {
+            BrowserOpError::Backend(format!(
+                "no Camoufox sidecar is listening at {} — the engine does not launch one \
+                 automatically; start a Camoufox server process yourself, or build \
+                 wcore-browser with `--features chromium` and point it at a real \
+                 Chromium/Playwright browser",
+                self.base_url
+            ))
+        } else {
+            BrowserOpError::Network(e.to_string())
+        }
+    }
 }
 
 #[async_trait]
@@ -142,7 +166,7 @@ impl BrowserProvider for CamoufoxBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| BrowserOpError::Network(e.to_string()))?;
+            .map_err(|e| self.session_open_error(e))?;
         if !resp.status().is_success() {
             return Err(BrowserOpError::Backend(format!(
                 "open_session HTTP {}",
@@ -410,6 +434,27 @@ mod tests {
         let cf = CamoufoxBackend::new(server.uri());
         let sess = cf.open_session(false).await.unwrap();
         assert_eq!(sess.ctx.session_id, "sess-77");
+    }
+
+    // wayland#491 / wayland-core#113: a missing sidecar must not surface as
+    // a bare reqwest "error sending request for url (...)" — it must name
+    // the actual problem (no Camoufox sidecar) and how to get out of it.
+    #[tokio::test]
+    async fn open_session_connect_failure_is_actionable() {
+        // Bind loopback:0 to claim a free port, then drop the listener so
+        // nothing is there to accept — guarantees connection-refused (not a
+        // timeout) on the very next connect attempt.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cf = CamoufoxBackend::new(format!("http://{addr}"));
+        let err = cf.open_session(false).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no Camoufox sidecar is listening"),
+            "expected an actionable message naming the missing sidecar, got: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -58,6 +58,16 @@ pub struct OpenAIProvider {
     /// by reactive tools-unsupported 400s; read by `build_request_body` before
     /// attaching `body["tools"]`. Shared across clones via an inner `Arc`.
     tool_support: crate::tool_capability::ToolSupportCache,
+    /// #434 — the last `x-flux-routed-model` Flux SIGNALLED-BACK for a tier
+    /// alias (`flux-auto` / `flux-reasoning` / …) on THIS session, e.g.
+    /// `"deepseek-v4-pro"`. `request.model` stays the alias for the whole
+    /// conversation (Flux keys sticky routing off it), so
+    /// `requires_reasoning_content_replay` never matches on the wire model
+    /// alone — this is the durable fix for the #417 replay gap on an aliased
+    /// strict reasoner: once Flux has revealed what actually served the turn,
+    /// `message_compat` consults this hint on every later turn of the same
+    /// alias. `None` until a Flux response has signalled it back.
+    flux_routed_model: Arc<Mutex<Option<String>>>,
 }
 
 impl OpenAIProvider {
@@ -71,6 +81,7 @@ impl OpenAIProvider {
             compat,
             debug,
             tool_support: crate::tool_capability::ToolSupportCache::new(),
+            flux_routed_model: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -93,6 +104,7 @@ impl OpenAIProvider {
             compat,
             debug,
             tool_support: crate::tool_capability::ToolSupportCache::new(),
+            flux_routed_model: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -227,10 +239,24 @@ impl OpenAIProvider {
     /// compat unchanged, so a non-strict model (e.g. claude-via-Flux) never
     /// replays an unsigned thinking block. Direct DeepSeek/Kimi already set the
     /// flag, so this is a no-op clone for them.
-    fn message_compat(compat: &ProviderCompat, model: &str) -> ProviderCompat {
-        if openai_compat::requires_reasoning_content_replay(model)
-            && !compat.replays_thinking_in_history()
-        {
+    ///
+    /// #434 — `model` alone misses a Flux TIER ALIAS (`flux-auto`,
+    /// `flux-reasoning`, …) that resolves server-side to a strict reasoner:
+    /// `request.model` stays the alias for the whole conversation, so
+    /// `requires_reasoning_content_replay` never matches on it. `routed_model`
+    /// is the last `x-flux-routed-model` Flux signalled back for this alias on
+    /// a PRIOR turn of the same session (`None` on turn 1, before any Flux
+    /// response has revealed it); when it names a strict reasoner, replay is
+    /// forced on for this alias too.
+    fn message_compat(
+        compat: &ProviderCompat,
+        model: &str,
+        routed_model: Option<&str>,
+    ) -> ProviderCompat {
+        let requires_replay = openai_compat::requires_reasoning_content_replay(model)
+            || (is_flux_tier_alias(model)
+                && routed_model.is_some_and(openai_compat::requires_reasoning_content_replay));
+        if requires_replay && !compat.replays_thinking_in_history() {
             let mut c = compat.clone();
             c.replays_thinking_in_history = Some(true);
             c
@@ -723,11 +749,18 @@ impl OpenAIProvider {
                 .unwrap_or("max_tokens")
         };
 
-        // #417 — resolve the effective message compat for THIS request's target
-        // model, so a router (Flux/OpenRouter) replays reasoning_content when it
-        // routes to a strict reasoner (DeepSeek/Kimi) without 400ing, while a
-        // non-strict model keeps replay off. See `message_compat`.
-        let msg_compat = Self::message_compat(&self.compat, &request.model);
+        // #417/#434 — resolve the effective message compat for THIS request's
+        // target model, so a router (Flux/OpenRouter) replays reasoning_content
+        // when it routes to a strict reasoner (DeepSeek/Kimi) without 400ing —
+        // directly, or via a tier alias Flux previously revealed as one — while
+        // a non-strict model keeps replay off. See `message_compat`.
+        let flux_routed_model = self
+            .flux_routed_model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let msg_compat =
+            Self::message_compat(&self.compat, &request.model, flux_routed_model.as_deref());
         let mut body = json!({
             "model": request.model,
             "messages": Self::build_messages(&request.messages, &request.system, &msg_compat),
@@ -1473,6 +1506,22 @@ impl LlmProvider for OpenAIProvider {
         // these headers, so the parse yields `None` and nothing is emitted —
         // the SSE body path is entirely unchanged.
         let provider_meta = parse_flux_response_meta(response.headers());
+
+        // #434 — stash the served model Flux just signalled back so a LATER
+        // turn on this same tier alias (`request.model` stays the alias for
+        // the whole conversation) can apply strict-reasoner
+        // `reasoning_content` replay via `message_compat`, even though the
+        // alias itself never matches `requires_reasoning_content_replay`.
+        if let Some(LlmEvent::ProviderMeta {
+            routed_model: Some(routed),
+            ..
+        }) = &provider_meta
+        {
+            *self
+                .flux_routed_model
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(routed.clone());
+        }
 
         tokio::spawn(async move {
             if let Some(meta) = provider_meta {
@@ -3107,7 +3156,7 @@ mod tests {
             !flux.replays_thinking_in_history(),
             "precondition: router compat has replay off"
         );
-        let resolved = OpenAIProvider::message_compat(&flux, "deepseek-v4-pro");
+        let resolved = OpenAIProvider::message_compat(&flux, "deepseek-v4-pro", None);
         assert!(
             resolved.replays_thinking_in_history(),
             "DeepSeek via Flux must replay reasoning_content"
@@ -3120,9 +3169,12 @@ mod tests {
         // thinking block. Ordinary OpenAI models stay off too.
         let flux = ProviderCompat::flux_router_defaults();
         assert!(
-            !OpenAIProvider::message_compat(&flux, "claude-opus-4-7").replays_thinking_in_history()
+            !OpenAIProvider::message_compat(&flux, "claude-opus-4-7", None)
+                .replays_thinking_in_history()
         );
-        assert!(!OpenAIProvider::message_compat(&flux, "gpt-4o").replays_thinking_in_history());
+        assert!(
+            !OpenAIProvider::message_compat(&flux, "gpt-4o", None).replays_thinking_in_history()
+        );
     }
 
     #[test]
@@ -3131,7 +3183,38 @@ mod tests {
         let ds = ProviderCompat::deepseek_defaults();
         assert!(ds.replays_thinking_in_history());
         assert!(
-            OpenAIProvider::message_compat(&ds, "deepseek-v4-pro").replays_thinking_in_history()
+            OpenAIProvider::message_compat(&ds, "deepseek-v4-pro", None)
+                .replays_thinking_in_history()
+        );
+    }
+
+    #[test]
+    fn message_compat_forces_replay_for_tier_alias_routed_to_strict_reasoner() {
+        // #434: a Flux TIER ALIAS (request.model stays "flux-reasoning" for the
+        // whole conversation) that a PRIOR turn revealed (via
+        // `x-flux-routed-model`) resolves to a strict reasoner must also
+        // replay, even though the alias itself never matches
+        // `requires_reasoning_content_replay`.
+        let flux = ProviderCompat::flux_router_defaults();
+        assert!(!openai_compat::requires_reasoning_content_replay(
+            "flux-reasoning"
+        ));
+        let resolved =
+            OpenAIProvider::message_compat(&flux, "flux-reasoning", Some("deepseek-v4-pro"));
+        assert!(
+            resolved.replays_thinking_in_history(),
+            "tier alias routed to DeepSeek must replay reasoning_content"
+        );
+    }
+
+    #[test]
+    fn message_compat_ignores_routed_model_hint_for_a_concrete_model() {
+        // The stashed hint from a PRIOR alias turn must never leak onto a turn
+        // whose OWN request.model is already a concrete non-strict id.
+        let flux = ProviderCompat::flux_router_defaults();
+        assert!(
+            !OpenAIProvider::message_compat(&flux, "gpt-4o", Some("deepseek-v4-pro"))
+                .replays_thinking_in_history()
         );
     }
 

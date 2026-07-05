@@ -145,6 +145,11 @@ pub struct ApprovalChannel {
     pub writer: Arc<dyn ProtocolEmitter>,
     pub msg_id: String,
     pub auto_approve: bool,
+    /// #584: the engine's `ApprovalBridge` redactor, so the choke-point
+    /// `ToolResult` emitted by `execute_tool_calls_with_approval` has
+    /// in-flight approval correlation ids scrubbed before any transport
+    /// (ACP, TUI, json-stream) sees it.
+    pub redactor: crate::output::protocol_sink::ActiveTokenRedactor,
 }
 
 /// Production `NodeExecutor` adapter — wraps `execute_tool_calls_*`.
@@ -320,6 +325,7 @@ async fn dispatch_once(
             cfg.toon_enabled,
             &cfg.cancel,
             cfg.file_write_notifier.as_ref(),
+            &approval.redactor,
         )
         .await
     } else {
@@ -447,6 +453,7 @@ mod tests {
             writer,
             msg_id: "test_msg".into(),
             auto_approve: true,
+            redactor: crate::output::protocol_sink::ActiveTokenRedactor::new(),
         });
         let cell = Arc::new(TokioMutex::new(TurnCell::new(vec![], None)));
         let exec: Arc<dyn NodeExecutor> = Arc::new(AgentNodeExecutor::new(cfg, cell.clone()));

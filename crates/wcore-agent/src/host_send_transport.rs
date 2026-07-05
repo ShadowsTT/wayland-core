@@ -184,6 +184,18 @@ pub struct HostDelegatedTransport {
     bridge: Arc<HostSendBridge>,
     output: Arc<dyn crate::output::OutputSink>,
     timeout: Duration,
+    /// wayland#585 (#574 follow-up) — per-conversation autonomous-send rate
+    /// limiter. `Self::new` leaves this DISABLED (`AutoReplyRateLimiter`'s own
+    /// `window == Duration::ZERO` convention) so an interactive/human-driven
+    /// engine's `send_message` calls are never throttled; [`Self::autonomous`]
+    /// turns it on for engines whose entire lifetime is autonomous,
+    /// inbound-channel-triggered turns. Without this, such an engine's
+    /// `send_message` tool call bypassed `run_turn`'s per-conversation
+    /// ping-pong guard entirely — this transport never touches
+    /// `wcore_channels::ChannelManager`/`AutoReplyRateLimiter` at all, so
+    /// gating it here (mirroring the SAME limiter design) is the seam that
+    /// covers the tool-driven send path.
+    rate_limiter: Mutex<wcore_channels::AutoReplyRateLimiter>,
 }
 
 impl HostDelegatedTransport {
@@ -192,6 +204,11 @@ impl HostDelegatedTransport {
             bridge,
             output,
             timeout: HOST_SEND_TIMEOUT,
+            rate_limiter: Mutex::new(wcore_channels::AutoReplyRateLimiter::new(
+                0,
+                Duration::ZERO,
+                0,
+            )),
         }
     }
 
@@ -201,11 +218,46 @@ impl HostDelegatedTransport {
         self.timeout = timeout;
         self
     }
+
+    /// Enable the per-conversation autonomous-send rate limiter (wayland#585).
+    /// Wire this ONLY for engines whose whole lifetime is autonomous,
+    /// inbound-triggered turns (today: the isolated per-session engines
+    /// `ChannelTurnDispatcher` builds) — never for an interactive/human-driven
+    /// engine, whose `send_message` calls must stay unthrottled.
+    pub fn autonomous(mut self) -> Self {
+        self.rate_limiter = Mutex::new(wcore_channels::AutoReplyRateLimiter::default());
+        self
+    }
 }
 
 #[async_trait]
 impl MessageTransport for HostDelegatedTransport {
     async fn send(&self, target: &ParsedTarget, message: &str) -> SendOutcome {
+        // Rate-gate BEFORE any host round-trip. Keyed on platform + chat id
+        // (the transport never sees the kernel session key `run_turn` uses —
+        // it only has the parsed send target) — a coarser but still
+        // per-conversation key. Disabled (default) limiters always return
+        // `true` here, so this is a no-op for non-autonomous engines.
+        let conversation = format!(
+            "{}:{}",
+            target.platform.as_str(),
+            target.chat_id.as_deref().unwrap_or("")
+        );
+        let allowed = {
+            let mut limiter = self
+                .rate_limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            limiter.check_and_record(&conversation, std::time::Instant::now())
+        };
+        if !allowed {
+            return SendOutcome::Err {
+                message: "autonomous send rate limit reached for this conversation; \
+                          suppressed to prevent a runaway auto-reply loop"
+                    .to_string(),
+            };
+        }
+
         let call_id = format!("hsm-{}", uuid::Uuid::new_v4());
         // Register BEFORE emit — an instant host reply must find the waiter.
         let rx = self.bridge.register(call_id.clone());
@@ -643,5 +695,68 @@ mod tests {
             // `send` dropped here — simulates Esc/Stop cancelling the turn.
         }
         assert_eq!(bridge.pending_count(), 0, "drop guard must clean the entry");
+    }
+
+    /// wayland#585: the DEFAULT transport (no `.autonomous()`) never
+    /// rate-limits — an interactive/human-driven engine's `send_message`
+    /// calls must reach the host every time, however many are made.
+    #[tokio::test]
+    async fn default_transport_never_rate_limits() {
+        let bridge = Arc::new(HostSendBridge::new());
+        let sink = Arc::new(InstantReplySink {
+            bridge: bridge.clone(),
+            resolved_ok: AtomicUsize::new(0),
+        });
+        let transport = HostDelegatedTransport::new(bridge.clone(), sink.clone());
+
+        // Comfortably above the default autonomous cap — must all succeed.
+        for _ in 0..(wcore_channels::DEFAULT_MAX_AUTO_REPLIES + 10) {
+            let outcome = transport.send(&email_target(), "hi").await;
+            assert!(matches!(outcome, SendOutcome::Ok { .. }));
+        }
+    }
+
+    /// wayland#585 (#574 follow-up): `.autonomous()` caps a conversation's
+    /// tool-driven sends at the same per-conversation budget `run_turn`'s
+    /// return-value reply path enforces, closing the bypass where an agent's
+    /// `send_message` call during a turn skipped the ping-pong guard
+    /// entirely. The suppressed call never reaches the host at all (no new
+    /// pending bridge entry), and a DIFFERENT conversation is unaffected.
+    #[tokio::test]
+    async fn autonomous_transport_rate_limits_per_conversation() {
+        let bridge = Arc::new(HostSendBridge::new());
+        let sink = Arc::new(InstantReplySink {
+            bridge: bridge.clone(),
+            resolved_ok: AtomicUsize::new(0),
+        });
+        let transport = HostDelegatedTransport::new(bridge.clone(), sink.clone()).autonomous();
+
+        for _ in 0..wcore_channels::DEFAULT_MAX_AUTO_REPLIES {
+            let outcome = transport.send(&email_target(), "hi").await;
+            assert!(matches!(outcome, SendOutcome::Ok { .. }));
+        }
+        match transport.send(&email_target(), "hi").await {
+            SendOutcome::Err { message } => assert!(
+                message.contains("rate limit"),
+                "expected a rate-limit error, got: {message}"
+            ),
+            SendOutcome::Ok { .. } => panic!("expected the cap to suppress this send"),
+        }
+        assert_eq!(
+            bridge.pending_count(),
+            0,
+            "a suppressed send must never register a host waiter"
+        );
+
+        // A different conversation carries its own, untouched budget.
+        let other = ParsedTarget {
+            platform: MessagingPlatform::Email,
+            chat_id: Some("someone-else@example.com".to_string()),
+            thread_id: None,
+        };
+        assert!(matches!(
+            transport.send(&other, "hi").await,
+            SendOutcome::Ok { .. }
+        ));
     }
 }

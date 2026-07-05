@@ -177,6 +177,23 @@ impl Tool for ReadTool {
             }
         };
 
+        // #644: a FIFO, char/block device, or socket passes `validate_user_path`
+        // (which only checks path shape) but streaming it via `fs::read` can
+        // hang forever or return unbounded bytes — e.g. `/dev/zero` reports a
+        // 0-byte size yet never ends. Refuse anything that EXISTS but isn't a
+        // regular file. A missing path (`Err`) or a directory (`is_dir`) still
+        // falls through to the read below, unchanged, so the existing "Failed
+        // to read file" error stays intact for those cases.
+        if let Ok(meta) = std::fs::metadata(&validated)
+            && !meta.is_file()
+            && !meta.is_dir()
+        {
+            return ToolResult {
+                content: format!("Refused to read {file_path}: not a regular file"),
+                is_error: true,
+            };
+        }
+
         let offset = input["offset"].as_u64().map(|v| v as usize);
         let limit = input["limit"].as_u64().map(|v| v as usize);
         // Token-opt (semantic slicing): an explicit symbol request bypasses the
@@ -312,6 +329,22 @@ impl Tool for ReadTool {
         let symbol = input["symbol"].as_str().filter(|s| !s.is_empty());
 
         let path = validated.as_path();
+
+        // #644: same DoS guard as `execute()`, routed through the vfs so a
+        // sandboxed sub-agent's containment-resolved target is what gets
+        // checked. Only refuses a path that EXISTS and isn't a regular file
+        // (FIFO/device/socket); a missing path or directory still falls
+        // through to the read below unchanged.
+        if let Ok(meta) = ctx.vfs.metadata(path).await
+            && !meta.is_file
+            && !meta.is_dir
+        {
+            return ToolResult {
+                content: format!("Refused to read {file_path}: not a regular file"),
+                is_error: true,
+            };
+        }
+
         let mtime_ms = file_mtime_ms(path);
 
         // Single locked pass over the cache: serve the unchanged stub, and (if
@@ -596,6 +629,56 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("Failed to read file"));
+    }
+
+    // #644: a FIFO passes `validate_user_path` (path-shape only) but streaming
+    // it would hang waiting for a writer — the is_file() guard must catch it
+    // before any read is attempted, not time out mid-read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_refuses_fifo() {
+        use std::ffi::CString;
+
+        let dir = tempdir().unwrap();
+        let fifo_path = dir.path().join("evil.fifo");
+        let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let tool = ReadTool::new(None);
+        let input = json!({ "file_path": fifo_path.to_str().unwrap() });
+        let result = tool.execute(input).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("not a regular file"),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_with_ctx_refuses_fifo() {
+        use std::ffi::CString;
+
+        let dir = tempdir().unwrap();
+        let fifo_path = dir.path().join("evil.fifo");
+        let c_path = CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed");
+
+        let tool = ReadTool::new(None);
+        let ctx = ToolContext::test_default();
+        let input = json!({ "file_path": fifo_path.to_str().unwrap() });
+        let result = tool.execute_with_ctx(input, &ctx).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("not a regular file"),
+            "got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

@@ -19,7 +19,11 @@
 //!   bypass `SecretDenyFs`. The exec-time gate in `bash.rs` is the
 //!   authoritative boundary; this UX drop prevents advertising a tool that
 //!   would always refuse.
-//! - **Full**: no filtering, no jail — identical to a local CLI session.
+//! - **Full**: no tool filtering, no fs jail — identical to a local CLI
+//!   session, EXCEPT the in-process file tools still sit behind
+//!   [`SecretDenyFs`] (#667) so a remote Full sender can't `Read`/`Glob` the
+//!   project's own `.env` or the user's credential stores; only the
+//!   confinement is skipped.
 //!
 //! Enforcement is at the [`ToolRegistry`] (not just the LLM schema): a
 //! dropped tool is un-dispatchable, so even a hallucinated call cannot
@@ -128,10 +132,12 @@ fn keep_under(posture: ChannelToolPosture, tool: &dyn Tool, read_deny_enforced: 
 /// `Workspace` posture — a UX gate so the LLM schema doesn't advertise a
 /// tool that would always refuse at exec time.
 ///
-/// A no-op for [`ChannelToolPosture::Full`] (and never called for a local
-/// CLI engine, which has no scope). Must run AFTER the full toolset —
-/// including MCP tools — is registered, and BEFORE the registry is moved
-/// into the engine.
+/// Never called for a local CLI engine (which has no scope). Drops no tools
+/// for [`ChannelToolPosture::Full`] and installs no fs jail, but (#667) still
+/// wraps the tool vfs in `SecretDenyFs` so the project's own secrets and the
+/// user's credential stores stay off-limits to the file tools. Must run
+/// AFTER the full toolset — including MCP tools — is registered, and BEFORE
+/// the registry is moved into the engine.
 pub fn apply_posture(
     registry: &mut ToolRegistry,
     scope: &ChannelToolScope,
@@ -152,6 +158,25 @@ pub fn apply_posture(
             scope.workspace_root.clone(),
         );
         registry.set_tool_vfs(Arc::new(jail));
+        registry.set_workspace_policy(policy);
+    }
+    if scope.posture == ChannelToolPosture::Full {
+        // #667: `Full` is still a remote channel sender — it just gets no fs
+        // jail (see module docs). Without this, the in-process file tools
+        // (Read/Write/Edit, and anything else routed through `ctx.vfs`) sat on
+        // a bare `RealFs` and could read the project's own `.env` / the user's
+        // credential stores, even though `Bash`'s OS sandbox already denies
+        // those reads (`WorkspacePolicy::secret_deny_paths`). Wrap `RealFs` in
+        // `SecretDenyFs` (lexical `is_secret_path` check, trust-independent)
+        // so the same secrets are off-limits through the file tools too. No
+        // `SandboxedFs` — Full stays deliberately unconfined otherwise.
+        let policy = Arc::new(wcore_tools::workspace_policy::WorkspacePolicy::trusted_local(
+            scope.workspace_root.clone(),
+        ));
+        registry.set_tool_vfs(Arc::new(wcore_tools::vfs::SecretDenyFs::new(
+            wcore_tools::vfs::RealFs,
+            Arc::clone(&policy),
+        )));
         registry.set_workspace_policy(policy);
     }
 }
@@ -468,5 +493,41 @@ mod tests {
             .workspace_policy()
             .expect("Workspace installs a policy");
         assert_eq!(policy.trust(), wcore_tools::WorkspaceTrust::Contained);
+    }
+
+    /// #667: `Full` posture still wraps the tool vfs in `SecretDenyFs` — a
+    /// project `.env` is refused while an ordinary file reads fine, and (since
+    /// Full is unconfined) a path outside `workspace_root` also reads fine.
+    #[tokio::test]
+    async fn apply_posture_full_denies_secrets_but_stays_unjailed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), b"SECRET=x").unwrap();
+        std::fs::write(dir.path().join("main.rs"), b"fn main() {}").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        let scope = ChannelToolScope {
+            posture: ChannelToolPosture::Full,
+            workspace_root: dir.path().to_path_buf(),
+        };
+        apply_posture(&mut registry, &scope, false);
+
+        let policy = registry
+            .workspace_policy()
+            .expect("Full posture installs a (Trusted) policy for Bash's OS sandbox");
+        assert_eq!(policy.trust(), wcore_tools::WorkspaceTrust::Trusted);
+
+        let vfs = registry
+            .tool_vfs()
+            .expect("Full posture still wraps the vfs in SecretDenyFs");
+        assert!(
+            vfs.read(&dir.path().join(".env")).await.is_err(),
+            "Full posture must still refuse the project .env via the file tools"
+        );
+        assert_eq!(
+            vfs.read(&dir.path().join("main.rs")).await.unwrap(),
+            b"fn main() {}"
+        );
+        // Unconfined: no SandboxedFs root, unlike Workspace posture.
+        assert!(vfs.root().is_none(), "Full posture must not pin a jail root");
     }
 }

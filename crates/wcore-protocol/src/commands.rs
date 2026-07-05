@@ -62,6 +62,14 @@ pub enum ProtocolCommand {
         url: Option<String>,
         #[serde(default)]
         headers: Option<HashMap<String, String>>,
+        /// #614 — per-assistant scoping allow-list for a runtime-added
+        /// server, mirroring `McpServerConfig::only_for_assistant` (#111).
+        /// `None`/empty ⇒ global (today's behavior, back-compat with hosts
+        /// that predate this field). `Some([...])` ⇒ the engine connects it
+        /// only when the session's active assistant is in the list —
+        /// FAIL-CLOSED, same as the config-declared path.
+        #[serde(default)]
+        only_for_assistant: Option<Vec<String>>,
     },
     /// W7 S4: resume a session that emitted `ApprovalRequired`. The
     /// host echoes the `resume_token` from the corresponding event so
@@ -262,6 +270,7 @@ mod tests {
                 env,
                 url,
                 headers,
+                only_for_assistant,
             } => {
                 assert_eq!(name, "team-tools");
                 assert_eq!(transport, "stdio");
@@ -270,6 +279,7 @@ mod tests {
                 assert_eq!(env.unwrap().get("TOKEN").unwrap(), "abc123");
                 assert!(url.is_none());
                 assert!(headers.is_none());
+                assert!(only_for_assistant.is_none());
             }
             _ => panic!("expected AddMcpServer"),
         }
@@ -306,6 +316,30 @@ mod tests {
                 assert!(command.is_none());
                 assert_eq!(url.unwrap(), "http://localhost:8080/sse");
                 assert_eq!(headers.unwrap().get("Authorization").unwrap(), "Bearer tok");
+            }
+            _ => panic!("expected AddMcpServer"),
+        }
+    }
+
+    /// #614 — a host may scope a runtime-added server to specific
+    /// assistants, same allow-list shape as the config-declared
+    /// `only_for_assistant` (#111). Absent ⇒ `None` (global), covered by
+    /// `add_mcp_server_stdio_deserialize` above.
+    #[test]
+    fn add_mcp_server_scoped_deserialize() {
+        let json = r#"{
+            "type": "add_mcp_server",
+            "name": "diag-tools",
+            "transport": "stdio",
+            "command": "diag-mcp",
+            "only_for_assistant": ["concierge"]
+        }"#;
+        let cmd: ProtocolCommand = serde_json::from_str(json).unwrap();
+        match cmd {
+            ProtocolCommand::AddMcpServer {
+                only_for_assistant, ..
+            } => {
+                assert_eq!(only_for_assistant.unwrap(), vec!["concierge".to_string()]);
             }
             _ => panic!("expected AddMcpServer"),
         }

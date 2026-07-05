@@ -1407,6 +1407,13 @@ pub struct AgentEngine {
     current_session: Option<Session>,
     output: Arc<dyn OutputSink>,
     current_msg_id: String,
+    /// #648: composer-dropped image(s) queued via [`queue_image_blocks`] for
+    /// the NEXT `run()` call. Drained (via `mem::take`) into the user turn's
+    /// content by `push_user_turn` so a single dropped image rides the main
+    /// conversation as a native `ContentBlock::Image` instead of being lost.
+    /// Empty in the common (no-attachment) case — every existing `run()`
+    /// caller is unaffected.
+    pending_image_blocks: Vec<ContentBlock>,
     /// #279(c): stable per-agent-run id, minted once per run() entry and
     /// held across the run's turns. Distinct from internal spawn/workflow
     /// run ids. None until the first run() of the session.
@@ -1962,6 +1969,7 @@ impl AgentEngine {
             current_session: None,
             output,
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -2140,6 +2148,7 @@ impl AgentEngine {
             current_session: Some(session),
             output,
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -3720,12 +3729,30 @@ impl AgentEngine {
     /// compaction preserves the pairing. Synthetic error results are
     /// bundled into this same user message so conversation roles stay
     /// strictly alternating.
+    ///
+    /// #648: also drains any `pending_image_blocks` queued via
+    /// [`Self::queue_image_blocks`] onto this same user turn, so a
+    /// composer-dropped image rides the main conversation as a native
+    /// `ContentBlock::Image` alongside the user's text.
     fn push_user_turn(&mut self, user_input: &str) {
         let mut content: Vec<ContentBlock> = Self::orphan_repair_results(self.messages.last());
         content.push(ContentBlock::Text {
             text: user_input.to_string(),
         });
+        content.extend(std::mem::take(&mut self.pending_image_blocks));
         self.messages.push(Message::now(Role::User, content));
+    }
+
+    /// #648: queue image content block(s) to be attached to the NEXT
+    /// `run()`'s user turn (drained by `push_user_turn`). Called by the
+    /// host (e.g. the json-stream `Message` command handler) after
+    /// resolving any image-typed `files[]` entries to bytes — the engine
+    /// never touches the filesystem itself. A no-op call (empty vec) is
+    /// harmless; blocks queued but never consumed by a `run()` (e.g. the
+    /// turn was pre-empted by a slash command) are simply dropped, not
+    /// carried forward to a later unrelated turn.
+    pub fn queue_image_blocks(&mut self, blocks: Vec<ContentBlock>) {
+        self.pending_image_blocks = blocks;
     }
 
     /// AUDIT D-6 — synthesize the `ToolResult` blocks needed to repair a
@@ -4838,17 +4865,22 @@ impl AgentEngine {
                         // paste truncates well under the window and the
                         // drop-oldest pass mops up any residual.
                         let per_block_budget = ceiling as usize;
-                        // The dispatched-set result drives the user notification:
-                        // rung 2 is LOSSY (truncates pasted content, drops oldest
+                        // Rung 2 is LOSSY (truncates pasted content, drops oldest
                         // turns) and irreversible, unlike rung 1's disk-spill — so
-                        // it must never fire silently.
-                        rung2_fired = crate::compact::degrade::degrade_conversation_overflow(
+                        // it must never fire silently. OR-combine both calls: the
+                        // persisted-history pass (`self.messages`) can degrade
+                        // independently of the dispatched-request pass (e.g. the
+                        // dispatched set is already under budget from rung 1 but
+                        // the fuller persisted history still isn't), so dropping
+                        // its return value would let a lossy history mutation
+                        // fire without the user-visible notification below.
+                        rung2_fired |= crate::compact::degrade::degrade_conversation_overflow(
                             &mut request.messages,
                             ceiling,
                             per_block_budget,
                             est,
                         );
-                        crate::compact::degrade::degrade_conversation_overflow(
+                        rung2_fired |= crate::compact::degrade::degrade_conversation_overflow(
                             &mut self.messages,
                             ceiling,
                             per_block_budget,
@@ -5721,6 +5753,11 @@ impl AgentEngine {
                     writer,
                     msg_id: self.current_msg_id.clone(),
                     auto_approve,
+                    // #584: same bridge instance the engine uses for
+                    // bridge-backed approvals (crucible/egress) — its
+                    // redactor tracks the live in-flight correlation-id set
+                    // regardless of transport (ACP, TUI, json-stream).
+                    redactor: self.approval_bridge.redactor(),
                 }
             });
             let exec_cfg = AgentExecutorConfig {
@@ -9115,6 +9152,7 @@ mod set_config_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -10287,6 +10325,7 @@ mod phase6_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -10515,6 +10554,9 @@ mod compact_tests {
     // v0.8.0 Task M: inline-test fixture builders need access to the
     // engine-private user-id resolver.
     use super::resolve_user_model_user_id;
+    // #648: push_user_turn/queue_image_blocks vision-attach tests below
+    // assert on the engine-private vision-routing signal directly.
+    use super::message_requires_vision;
     use wcore_types::message::{ContentBlock, Message, Role};
 
     use crate::approval::ApprovalBridge;
@@ -10582,6 +10624,7 @@ mod compact_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -10708,6 +10751,32 @@ mod compact_tests {
         assert_eq!(m.role, Role::User);
         assert_eq!(m.content.len(), 1);
         assert!(matches!(&m.content[0], ContentBlock::Text { text } if text == "hello"));
+    }
+
+    /// #648: an image queued via `queue_image_blocks` before `push_user_turn`
+    /// rides the SAME user turn as the text, and is drained (not left to
+    /// leak into a later, unrelated turn).
+    #[test]
+    fn push_user_turn_attaches_and_drains_queued_image_block() {
+        let mut engine = engine_with_history(vec![]);
+        engine.queue_image_blocks(vec![ContentBlock::Image {
+            mime: "image/png".to_string(),
+            data: "Zm9v".to_string(),
+        }]);
+        engine.push_user_turn("look at this");
+
+        assert_eq!(engine.messages.len(), 1);
+        let m = &engine.messages[0];
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.content.len(), 2);
+        assert!(matches!(&m.content[0], ContentBlock::Text { text } if text == "look at this"));
+        assert!(matches!(&m.content[1], ContentBlock::Image { mime, .. } if mime == "image/png"));
+        assert!(message_requires_vision(&engine.messages));
+
+        // A second turn with nothing queued must NOT resurrect the image.
+        engine.push_user_turn("a follow-up with no attachment");
+        assert_eq!(engine.messages.len(), 2);
+        assert_eq!(engine.messages[1].content.len(), 1);
     }
 
     #[test]
@@ -11907,6 +11976,7 @@ mod plan_mode_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -12335,6 +12405,7 @@ mod hook_integration_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -13169,6 +13240,7 @@ mod approval_bridge_engine_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),
@@ -14171,6 +14243,7 @@ mod user_model_writeback_tests {
             current_session: None,
             output: Arc::new(NullOutput),
             current_msg_id: String::new(),
+            pending_image_blocks: Vec::new(),
             current_agent_run_id: None,
             approval_manager: None,
             approval_bridge: Arc::new(ApprovalBridge::new()),

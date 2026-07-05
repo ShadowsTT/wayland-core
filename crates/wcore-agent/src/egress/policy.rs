@@ -115,8 +115,16 @@ impl AgentEgressPolicy {
     /// sensitive leaves on a data-less read, and the exfil boundary stays
     /// hard-denied regardless. With a doorbell, prompt once/always/no; on
     /// "always" persist the registrable domain so subsequent reaches are silent.
+    ///
+    /// #569 — prefers the current task's scoped doorbell (see
+    /// `super::session_scope`) over this policy's shared slot, so a
+    /// session's own `Ask`s ring its own approval bridge even while another
+    /// session's bootstrap has re-pointed the shared slot at itself. Falls
+    /// back to the shared slot when the current task never scoped one
+    /// (single-session TUI/stdin, or a detached sub-agent task).
     async fn resolve_ask(&self, host: &str, registrable: &str, reason: &str) -> EgressDecision {
-        let doorbell = self.doorbell.read().ok().and_then(|slot| slot.clone());
+        let doorbell = super::session_scope::current()
+            .or_else(|| self.doorbell.read().ok().and_then(|slot| slot.clone()));
         let Some(doorbell) = doorbell else {
             return EgressDecision::Allow;
         };
@@ -374,5 +382,55 @@ mod tests {
             bell.asked.lock().unwrap().is_empty(),
             "doorbell must only be rung for the Ask verdict"
         );
+    }
+
+    // ── #569 — task-scoped doorbell takes priority over the shared slot ────
+
+    #[tokio::test]
+    async fn task_scoped_doorbell_wins_over_the_shared_slot() {
+        // Simulates two "sessions" sharing one `AgentEgressPolicy` (the real
+        // process-global chokepoint): the shared slot is bound to session B
+        // (whichever bootstrapped last), but session A's own task scopes its
+        // own doorbell via `session_scope::with_doorbell` around its turn.
+        // The scoped doorbell — session A's own — must win, not the shared
+        // slot pointing at B.
+        let p = AgentEgressPolicy::enforcing(AllowList::default());
+        let shared_bell = FixedDoorbell::new(ConsentDecision::No); // "session B"
+        p.set_doorbell(shared_bell.clone());
+        let scoped_bell = FixedDoorbell::new(ConsentDecision::Once); // "session A"
+
+        let request = req(reqwest::Method::GET, "https://react.dev/learn");
+        let decision = super::super::session_scope::with_doorbell(
+            Some(scoped_bell.clone()),
+            p.check(&request),
+        )
+        .await;
+
+        assert!(matches!(decision, EgressDecision::Allow));
+        assert_eq!(
+            scoped_bell.asked.lock().unwrap().as_slice(),
+            &["react.dev"],
+            "the task-scoped doorbell (session A's own) must be rung"
+        );
+        assert!(
+            shared_bell.asked.lock().unwrap().is_empty(),
+            "the shared slot (pointing at a different session) must NOT be rung \
+             while a task-scoped doorbell is bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_shared_slot_when_nothing_is_task_scoped() {
+        // Single-session TUI/stdin flow: nothing ever calls `with_doorbell`,
+        // so `resolve_ask` must still use the shared slot (pre-#569 behavior).
+        let p = AgentEgressPolicy::enforcing(AllowList::default());
+        let shared_bell = FixedDoorbell::new(ConsentDecision::Once);
+        p.set_doorbell(shared_bell.clone());
+
+        let d = p
+            .check(&req(reqwest::Method::GET, "https://react.dev/learn"))
+            .await;
+        assert!(matches!(d, EgressDecision::Allow));
+        assert_eq!(shared_bell.asked.lock().unwrap().len(), 1);
     }
 }

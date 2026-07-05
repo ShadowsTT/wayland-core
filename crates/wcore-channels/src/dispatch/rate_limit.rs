@@ -16,9 +16,14 @@
 //! logged by the caller) until enough of the window has elapsed for older sends
 //! to age out.
 //!
-//! Only autonomous auto-replies are gated. Human/operator-initiated sends (the
-//! `send_message` tool, cron, direct [`crate::ChannelManager::send_to`]) take a
-//! different code path and never reach this limiter.
+//! Only autonomous auto-replies are gated by the limiter instance `run_turn`
+//! owns. Human/operator-initiated sends (cron, direct
+//! [`crate::ChannelManager::send_to`]) take a different code path and never
+//! reach it. The `send_message` TOOL path is gated separately, with its own
+//! instance of this same type, at `wcore_agent::host_send_transport`'s
+//! `HostDelegatedTransport` — wired ON only for the isolated per-session
+//! engines that exist solely to auto-reply to inbound channel events, and
+//! OFF for an interactive/human-driven engine (wayland#585, #574 follow-up).
 //!
 //! Time is caller-supplied (`now: Instant`, monotonic) so the limiter is fully
 //! deterministic under test — it never reads the wall clock. Production callers
@@ -38,8 +43,10 @@ use std::time::{Duration, Instant};
 /// turns complete (seconds apart → hundreds per window) and is caught, while a
 /// person rapidly messaging their own agent stays under it. On the primary
 /// threat channel (email) a human never approaches this rate. Suppression logs
-/// at WARN (operator-visible); it does not surface a channel-side notice — that
-/// and tool-driven-send coverage are tracked follow-ups.
+/// at WARN (operator-visible) AND — once per suppression episode, via
+/// [`AutoReplyRateLimiter::take_notice_due`] — the caller sends a one-time
+/// channel-side notice so a human on an interactive channel is never left
+/// silently staring at a stopped agent (wayland#585).
 pub const DEFAULT_MAX_AUTO_REPLIES: usize = 30;
 
 /// Default rolling window for [`DEFAULT_MAX_AUTO_REPLIES`].
@@ -49,6 +56,20 @@ pub const DEFAULT_AUTO_REPLY_WINDOW: Duration = Duration::from_secs(600);
 /// Bounds memory under a flood of distinct conversation ids; least-recently
 /// active conversations are evicted first (their history would age out anyway).
 pub const DEFAULT_CONVERSATION_CAP: usize = 4096;
+
+/// Per-conversation rate history plus notice-gate state: whether a one-time
+/// "auto-replies rate-limited, pausing" channel notice has already been sent
+/// for the CURRENT suppression episode (see
+/// [`AutoReplyRateLimiter::take_notice_due`]).
+#[derive(Debug, Clone, Default)]
+struct ConversationState {
+    /// Ascending timestamps of the conversation's recent recorded sends.
+    history: VecDeque<Instant>,
+    /// `true` once a suppression notice has been sent for this episode;
+    /// cleared the next time a send is admitted, so a later episode notices
+    /// again.
+    notified: bool,
+}
 
 /// Per-conversation rolling-window rate limiter for autonomous sends.
 ///
@@ -67,8 +88,8 @@ pub struct AutoReplyRateLimiter {
     window: Duration,
     /// Upper bound on tracked conversations. `0` disables capping.
     cap: usize,
-    /// conversation id -> ascending timestamps of its recent recorded sends.
-    conversations: HashMap<String, VecDeque<Instant>>,
+    /// conversation id -> its recent send history + notice-gate state.
+    conversations: HashMap<String, ConversationState>,
 }
 
 impl AutoReplyRateLimiter {
@@ -100,16 +121,19 @@ impl AutoReplyRateLimiter {
 
         let window = self.window;
         let max_sends = self.max_sends;
-        let history = self
+        let state = self
             .conversations
             .entry(conversation.to_string())
             .or_default();
-        Self::prune(history, now, window);
+        Self::prune(&mut state.history, now, window);
 
-        let allowed = if history.len() >= max_sends {
+        let allowed = if state.history.len() >= max_sends {
             false
         } else {
-            history.push_back(now);
+            state.history.push_back(now);
+            // A fresh admitted send closes out any prior suppression episode
+            // — the next overflow is a NEW episode and may notice again.
+            state.notified = false;
             true
         };
 
@@ -117,6 +141,28 @@ impl AutoReplyRateLimiter {
         // just touched. Runs after recording so `conversation` is retained.
         self.enforce_cap(conversation);
         allowed
+    }
+
+    /// After a suppressed [`Self::check_and_record`] call, ask whether a
+    /// channel-side "auto-replies rate-limited, pausing" notice should ALSO be
+    /// sent for `conversation`.
+    ///
+    /// Returns `true` (and marks the conversation notified) only the FIRST
+    /// time this is called since the conversation's last admitted send —
+    /// bounding the notice to at most one extra message per suppression
+    /// episode, no matter how long the underlying ping-pong keeps hammering
+    /// the cap. Returns `false` once already notified for the current episode,
+    /// or if `conversation` carries no tracked state (should not happen
+    /// immediately after a suppressed call, but fails closed rather than
+    /// double-notifying).
+    pub fn take_notice_due(&mut self, conversation: &str) -> bool {
+        match self.conversations.get_mut(conversation) {
+            Some(state) if !state.notified => {
+                state.notified = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Drop timestamps at the front older than `window` (history is ascending,
@@ -142,13 +188,14 @@ impl AutoReplyRateLimiter {
             return;
         }
         // Empty histories carry no live rate state — reclaim them first.
-        self.conversations.retain(|k, h| k == keep || !h.is_empty());
+        self.conversations
+            .retain(|k, s| k == keep || !s.history.is_empty());
         while self.conversations.len() > self.cap {
             let victim = self
                 .conversations
                 .iter()
                 .filter(|(k, _)| k.as_str() != keep)
-                .min_by_key(|(_, h)| h.back().copied())
+                .min_by_key(|(_, s)| s.history.back().copied())
                 .map(|(k, _)| k.clone());
             match victim {
                 Some(v) => {
@@ -246,6 +293,41 @@ mod tests {
         assert!(!rl.check_and_record("b", after(t, 1)));
         // A third, fresh conversation still passes.
         assert!(rl.check_and_record("c", after(t, 1)));
+    }
+
+    #[test]
+    fn notice_due_once_per_suppression_episode() {
+        let mut rl = AutoReplyRateLimiter::new(2, Duration::from_secs(600), 1024);
+        let t = base();
+        assert!(rl.check_and_record("conv", t));
+        assert!(rl.check_and_record("conv", after(t, 1)));
+        // First overflow of this episode: a notice is due exactly once...
+        assert!(!rl.check_and_record("conv", after(t, 2)));
+        assert!(rl.take_notice_due("conv"));
+        // ...further suppressed sends in the SAME episode do not re-notice.
+        assert!(!rl.check_and_record("conv", after(t, 3)));
+        assert!(!rl.take_notice_due("conv"));
+        assert!(!rl.check_and_record("conv", after(t, 4)));
+        assert!(!rl.take_notice_due("conv"));
+
+        // Window rolls over, admitting a fresh send: the episode resets.
+        assert!(rl.check_and_record("conv", after(t, 600)));
+        // A brand new overflow now notices again.
+        assert!(!rl.check_and_record("conv", after(t, 601)));
+        assert!(rl.take_notice_due("conv"));
+    }
+
+    #[test]
+    fn notice_due_is_per_conversation() {
+        let mut rl = AutoReplyRateLimiter::new(1, Duration::from_secs(600), 1024);
+        let t = base();
+        assert!(rl.check_and_record("a", t));
+        assert!(rl.check_and_record("b", t));
+        assert!(!rl.check_and_record("a", after(t, 1)));
+        // "a" is suppressed and due a notice; "b" hasn't overflowed yet so it
+        // carries no pending notice.
+        assert!(rl.take_notice_due("a"));
+        assert!(!rl.take_notice_due("b"));
     }
 
     #[test]

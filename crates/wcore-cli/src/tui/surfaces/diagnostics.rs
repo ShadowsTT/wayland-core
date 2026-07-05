@@ -196,9 +196,13 @@ pub struct DoctorReport {
 struct ToolGate {
     /// The tool's host-facing name (matches `Tool::name()`).
     name: &'static str,
-    /// The env var the host probes to construct a real backend (e.g.
-    /// `DISCORD_BOT_TOKEN`). When set, the tool is enabled.
-    env_var: &'static str,
+    /// Every env var the host's resolver accepts for this tool, in the
+    /// resolver's own priority order (e.g. `["ANTHROPIC_API_KEY",
+    /// "OPENAI_API_KEY", "GEMINI_API_KEY"]` for vision). The tool is
+    /// enabled when *any* of these is set — a backend with several
+    /// accepted keys must not report "disabled" just because the user
+    /// set a valid non-first one.
+    env_vars: &'static [&'static str],
 }
 
 /// The curated list of external-service tools and their gating env vars.
@@ -206,51 +210,54 @@ struct ToolGate {
 const TOOL_GATES: &[ToolGate] = &[
     ToolGate {
         name: "github",
-        env_var: "GITHUB_TOKEN",
+        env_vars: &["GITHUB_TOKEN"],
     },
     ToolGate {
         name: "gitlab",
-        env_var: "GITLAB_TOKEN",
+        env_vars: &["GITLAB_TOKEN"],
     },
     ToolGate {
         name: "linear",
-        env_var: "LINEAR_API_KEY",
+        env_vars: &["LINEAR_API_KEY"],
     },
     ToolGate {
         name: "notion",
-        env_var: "NOTION_TOKEN",
+        env_vars: &["NOTION_TOKEN"],
     },
     ToolGate {
         name: "discord",
-        env_var: "DISCORD_BOT_TOKEN",
+        env_vars: &["DISCORD_BOT_TOKEN"],
     },
     ToolGate {
         name: "spotify",
-        env_var: "SPOTIFY_REFRESH_TOKEN",
+        env_vars: &["SPOTIFY_REFRESH_TOKEN"],
     },
     ToolGate {
         name: "google_meet",
-        env_var: "GOOGLE_OAUTH_CLIENT_ID",
+        env_vars: &["GOOGLE_OAUTH_CLIENT_ID"],
     },
     ToolGate {
         name: "web_search",
-        env_var: "BRAVE_API_KEY",
+        env_vars: &["BRAVE_API_KEY"],
     },
     ToolGate {
         name: "web_fetch",
-        env_var: "WAYLAND_FETCH_ALLOWED",
+        env_vars: &["WAYLAND_FETCH_ALLOWED"],
     },
+    // Resolver: `build_transcription_backend` — GROQ first, then OpenAI.
     ToolGate {
         name: "transcribe_audio",
-        env_var: "OPENAI_API_KEY",
+        env_vars: &["GROQ_API_KEY", "OPENAI_API_KEY"],
     },
+    // Resolver: `build_vision_backend` — Anthropic, then OpenAI, then Gemini.
     ToolGate {
         name: "vision_analyze",
-        env_var: "OPENAI_API_KEY",
+        env_vars: &["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"],
     },
+    // Resolver: `tts::build_tts_backend` — OpenAI, then ElevenLabs.
     ToolGate {
         name: "tts",
-        env_var: "OPENAI_API_KEY",
+        env_vars: &["OPENAI_API_KEY", "ELEVENLABS_API_KEY"],
     },
 ];
 
@@ -259,10 +266,11 @@ const TOOL_GATES: &[ToolGate] = &[
 pub struct ToolStatusRow {
     /// The tool's host-facing name.
     pub name: String,
-    /// Whether the env var that gates the tool is set (non-empty).
+    /// Whether *any* gating env var for the tool is set (non-empty).
     pub enabled: bool,
-    /// The gating env var the user would set to enable the tool.
-    pub env_var: String,
+    /// Every gating env var the user could set to enable the tool, in the
+    /// resolver's priority order.
+    pub env_vars: Vec<String>,
 }
 
 /// Snapshot of one recent engine error for the `/doctor` errors panel.
@@ -360,16 +368,19 @@ fn spawn_health_probe() -> std::sync::mpsc::Receiver<ProbeMsg> {
 }
 
 /// Build the per-tool backend-status snapshot by walking [`TOOL_GATES`]
-/// and probing each tool's gating env var. A tool is "enabled" only
-/// when its env var is set and non-empty (matching the
-/// `build_*_backend` resolver's empty-string-is-no-key semantic).
+/// and probing each tool's gating env vars. A tool is "enabled" when
+/// *any* accepted var is set and non-empty (matching the
+/// `build_*_backend` resolver, which tries each key in priority order
+/// and treats an empty string as no key). Probing only the first var
+/// would falsely report a configured tool as disabled when the user set
+/// a valid non-first key (e.g. `ANTHROPIC_API_KEY` for `vision_analyze`).
 fn scan_tool_status() -> Vec<ToolStatusRow> {
     TOOL_GATES
         .iter()
         .map(|gate| ToolStatusRow {
             name: gate.name.to_string(),
-            enabled: env_set_nonempty(gate.env_var),
-            env_var: gate.env_var.to_string(),
+            enabled: gate.env_vars.iter().copied().any(env_set_nonempty),
+            env_vars: gate.env_vars.iter().map(|v| v.to_string()).collect(),
         })
         .collect()
 }
@@ -1621,9 +1632,9 @@ impl DiagnosticsSurface {
                 (HealthState::Warn, "no")
             };
             let detail = if row.enabled {
-                format!("{label} · env {}", row.env_var)
+                format!("{label} · env {}", row.env_vars.join(" / "))
             } else {
-                format!("{label} · set {} to enable", row.env_var)
+                format!("{label} · set {} to enable", row.env_vars.join(" or "))
             };
             push_wrapped_status_rows(&mut lines, state, &row.name, &detail, t, avail_status);
         }
@@ -3115,19 +3126,23 @@ mod tests {
         s.on_enter(&mut app);
         let out = render_tall(&mut s, &app);
         assert!(out.contains("TOOLS"), "TOOLS section header missing");
-        // Every gate must appear by name, paired with its env var.
+        // Every gate must appear by name, paired with *every* env var its
+        // resolver accepts (not just the first) — that is the honest
+        // "set X to enable Y" a user needs when they hold a non-first key.
         for gate in TOOL_GATES {
             assert!(
                 out.contains(gate.name),
                 "tool `{}` missing from /doctor output",
                 gate.name
             );
-            assert!(
-                out.contains(gate.env_var),
-                "env var `{}` (for `{}`) missing from /doctor output",
-                gate.env_var,
-                gate.name
-            );
+            for env_var in gate.env_vars {
+                assert!(
+                    out.contains(env_var),
+                    "env var `{}` (for `{}`) missing from /doctor output",
+                    env_var,
+                    gate.name
+                );
+            }
         }
     }
 
