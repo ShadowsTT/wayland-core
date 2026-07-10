@@ -1,0 +1,59 @@
+name: Release after upstream sync
+
+# Option B: when the automated/upstream-sync PR merges into main (you review +
+# click Merge), push a release tag so the engine binaries rebuild. The existing
+# release.yml triggers on tags matching `v*-wayland-*`, so we tag
+# `v<cargo-version>-wayland-fork-<shortsha>` (unique + glob-matching). That
+# builds the wayland-core binaries + checksums and publishes them to THIS fork's
+# Releases, where the desktop app's engine updater can fetch them (once the app's
+# wcoreUpdater REPO is pointed at ShadowsTT/wayland-core). Your own commits on
+# main ride along via the merge.
+#
+# Needs a GH_TOKEN (PAT with repo scope) secret — the default GITHUB_TOKEN cannot
+# trigger release.yml from a tag push.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-release
+  cancel-in-progress: false
+
+jobs:
+  tag-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == 'automated/upstream-sync')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Tag from merged main (triggers release.yml)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          SHA="$(git rev-parse --short HEAD)"
+          TAG="v${VER}-wayland-fork-${SHA}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists — nothing to release."
+            exit 0
+          fi
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git tag "${TAG}"
+          git push origin "${TAG}"
+          echo "Pushed ${TAG} -> release.yml will build + publish the engine binaries."
