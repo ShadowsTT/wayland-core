@@ -337,8 +337,9 @@ pub struct ConfigFile {
     #[serde(default)]
     pub crucible: crate::crucible::CrucibleConfig,
 
-    /// Anvil (native gated-forge engine) — opt-in `[anvil]` block. OFF by
-    /// default (`enabled = false`), kill-switched until the A1 slice completes.
+    /// Anvil (native gated-forge engine) — `[anvil]` block. ON by default
+    /// (availability, not activity: the forge is invocation-only and refuses
+    /// without a real gate); `enabled = false` is the kill-switch.
     /// Lives on `ConfigFile` (the on-disk shape) alongside `[crucible]`; the
     /// `forge` entry point reads it via `load_merged_config_file`.
     #[serde(default)]
@@ -1337,6 +1338,22 @@ pub fn openai_model_accepts_effort(model: &str) -> bool {
 
 /// default-section config picks one. All four built-in providers now route
 /// through `wcore_types::model_aliases`, so an upstream model deprecation is
+/// Mid-tier "driver seat" model for Anvil forge builders (the Smart Loops
+/// seat split: the session/frontier model plans, a mid-tier model drives the
+/// turns, machinery verifies). Empty = no obvious mid tier in this family;
+/// the session model drives unchanged. Same table pattern as
+/// [`default_model_for`] — extend here, never inline in provider code.
+pub(crate) fn driver_model_for(provider: ProviderType) -> &'static str {
+    use wcore_types::model_aliases::{ANTHROPIC_SONNET, BEDROCK_SONNET, VERTEX_SONNET};
+    match provider {
+        ProviderType::Anthropic => ANTHROPIC_SONNET,
+        ProviderType::Bedrock => BEDROCK_SONNET,
+        ProviderType::Vertex => VERTEX_SONNET,
+        // Every other family: no confident mid-tier pick — session drives.
+        _ => "",
+    }
+}
+
 /// a one-line edit in that module (closes debt B.4 / HC-3-followup).
 pub(crate) fn default_model_for(provider: ProviderType) -> &'static str {
     use wcore_types::model_aliases::{
@@ -3654,10 +3671,25 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         global.crucible
     };
 
-    let anvil = if project.anvil.enabled {
-        project.anvil
-    } else {
-        global.anvil
+    // Anvil merges FIELD-WISE, and the kill-switch merges TIGHTEN-ONLY
+    // (GHSA-8r7g pattern, same as `auto_approve` above): a project config
+    // (untrusted — it travels with a cloned repo) may DISABLE Anvil and may
+    // set gate/driver-seat fields, but must NEVER re-enable a rail the
+    // operator kill-switched globally. Field-wise merging also means a
+    // project gate does not silently drop an unrelated global driver seat
+    // (and vice versa) the way a wholesale block replacement would.
+    let anvil = crate::anvil::AnvilConfig {
+        enabled: global.anvil.enabled && project.anvil.enabled,
+        gate: if project.anvil.gate.is_empty() {
+            global.anvil.gate
+        } else {
+            project.anvil.gate
+        },
+        driver_provider: project
+            .anvil
+            .driver_provider
+            .or(global.anvil.driver_provider),
+        driver_model: project.anvil.driver_model.or(global.anvil.driver_model),
     };
 
     ConfigFile {
@@ -5028,6 +5060,36 @@ mod tests {
             ApprovalMode::AutoEdit,
             "a project may tighten a looser global posture"
         );
+    }
+
+    #[test]
+    fn ghsa_project_cannot_reenable_kill_switched_anvil() {
+        // Same threat class, Anvil edition: a project block that sets ONLY
+        // `gate` wins the field-merge — but it must NOT carry its default
+        // `enabled: true` past a global `enabled = false` kill-switch.
+        let mut global = ConfigFile::default();
+        global.anvil.enabled = false;
+        let mut project = ConfigFile::default();
+        project.anvil.gate = vec!["cargo".into(), "test".into()];
+        assert!(project.anvil.enabled, "precondition: project default is ON");
+        let merged = merge_config_files(global, project);
+        assert!(
+            !merged.anvil.enabled,
+            "a project must not re-enable a globally kill-switched Anvil"
+        );
+        // The project's gate still merges — only the kill-switch is clamped.
+        assert_eq!(merged.anvil.gate, vec!["cargo", "test"]);
+    }
+
+    #[test]
+    fn anvil_project_kill_switch_still_wins() {
+        // The tighten direction is unaffected: project `enabled=false`
+        // disables even when global is on.
+        let global = ConfigFile::default();
+        let mut project = ConfigFile::default();
+        project.anvil.enabled = false;
+        let merged = merge_config_files(global, project);
+        assert!(!merged.anvil.enabled);
     }
 
     #[test]
