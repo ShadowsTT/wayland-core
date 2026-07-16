@@ -312,6 +312,12 @@ struct Cli {
     #[arg(long)]
     config_path: bool,
 
+    /// Print build provenance (version + embedded source git SHA) and exit.
+    /// Catches the stale-build class: the SHA must match the HEAD the binary
+    /// was compiled from. Used by the build-provenance integration test.
+    #[arg(long)]
+    build_info: bool,
+
     /// Print skill directory paths and exit
     #[arg(long)]
     skills_path: bool,
@@ -498,6 +504,10 @@ enum TopCmd {
         #[arg(long)]
         terminal: bool,
     },
+    /// Anvil (gated forge) — forge a candidate that passes a REAL executable
+    /// gate (tests / build / lint), then stamp a verified receipt. Requires
+    /// ON by default; `[anvil] enabled = false` is the kill-switch. Empty gate config auto-detects the workspace suite.
+    Forge(wcore_cli::anvil::ForgeArgs),
     /// v0.7.0 Task 1.C.1: print resolved project context from WAYLAND.md /
     /// AGENTS.md / .wayland/context.md / CLAUDE.md walking up from cwd.
     ProjectContext,
@@ -558,6 +568,11 @@ enum TopCmd {
     Profile {
         #[command(subcommand)]
         cmd: wcore_cli::profile::ProfileCmd,
+    },
+    /// Import an existing agent setup (Hermes) into wayland-core profiles.
+    Migrate {
+        #[command(subcommand)]
+        cmd: wcore_cli::migrate::MigrateCmd,
     },
 }
 
@@ -810,21 +825,25 @@ async fn run() -> anyhow::Result<ExitCode> {
     // existing CI scrapers.
     let mut _sentinel_guard = {
         let sentinel_path = wcore_cli::crash_sentinel::CrashSentinel::default_path();
-        // R2 fix A5: probe + arm via a SINGLE fs::write (was: probe via
-        // arm() then write again via new() — double-write that could
-        // discard a successful first write on second-write failure).
-        let was_dirty = wcore_cli::crash_sentinel::CrashSentinel::check_dirty(&sentinel_path);
-        if was_dirty {
+        // #181: the sentinel is scoped per-process (`.dirty-death.<pid>`).
+        // The scan reports ONLY flags whose owning pid is dead (plus the
+        // legacy un-scoped flag, once, for migration) — a live sibling
+        // engine's flag is not a crash. Reported flags are reaped by the
+        // scan so each dirty death fires exactly once.
+        let dead_sentinels = wcore_cli::crash_sentinel::CrashSentinel::scan_dead_sentinels(
+            &wcore_cli::crash_sentinel::CrashSentinel::default_dir(),
+        );
+        for dead_path in &dead_sentinels {
             if will_enter_tui {
                 tracing::warn!(
-                    path = %sentinel_path.display(),
+                    path = %dead_path.display(),
                     "previous run did not shut down cleanly (crash sentinel found)"
                 );
             } else {
                 eprintln!(
                     "wayland-core: warning: previous run did not shut down cleanly \
                      (crash sentinel found at {})",
-                    sentinel_path.display()
+                    dead_path.display()
                 );
             }
         }
@@ -876,6 +895,11 @@ async fn run() -> anyhow::Result<ExitCode> {
             // Best-effort: remove the sentinel so the next restart
             // doesn't falsely report a crash.
             let _ = std::fs::remove_file(&sentinel_path_for_sig);
+            // PR-7: reap any live per-profile supervisor children before exit.
+            // std::process::exit bypasses Drop, so the router's Drop-based
+            // reaping never runs on a signal — without this, SIGTERM/SIGINT/
+            // SIGHUP orphans every credential-bearing `acp serve --profile` child.
+            wcore_cli::profile_router::reap_all_children_blocking();
             std::process::exit(0);
         });
     }
@@ -895,6 +919,10 @@ async fn run() -> anyhow::Result<ExitCode> {
             // before a hard kill.
             let _ = tokio::signal::ctrl_c().await;
             let _ = std::fs::remove_file(&sentinel_path_for_sig);
+            // PR-7: reap live per-profile children before exit (exit bypasses
+            // Drop). Without this, a Ctrl+C / TerminateProcess orphans every
+            // credential-bearing `acp serve --profile` child.
+            wcore_cli::profile_router::reap_all_children_blocking();
             std::process::exit(0);
         });
     }
@@ -1019,6 +1047,13 @@ async fn run() -> anyhow::Result<ExitCode> {
                     }
                 }
             }
+            TopCmd::Forge(args) => match wcore_cli::anvil::run_forge(args).await {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(e) => {
+                    eprintln!("wayland-core forge: {e:#}");
+                    Ok(ExitCode::FAILURE)
+                }
+            },
             // methodology #27: production caller for project_context::scan
             // (v0.7.0 Task 1.C.1).
             TopCmd::ProjectContext => {
@@ -1140,6 +1175,14 @@ async fn run() -> anyhow::Result<ExitCode> {
                     Ok(ExitCode::FAILURE)
                 }
             },
+            // `migrate::run` is synchronous — no `.await` (mirrors `TopCmd::Profile`).
+            TopCmd::Migrate { cmd } => match wcore_cli::migrate::run(cmd) {
+                Ok(()) => Ok(ExitCode::SUCCESS),
+                Err(e) => {
+                    eprintln!("wayland-core migrate: {e:#}");
+                    Ok(ExitCode::FAILURE)
+                }
+            },
         };
     }
 
@@ -1153,6 +1196,16 @@ async fn run() -> anyhow::Result<ExitCode> {
     // touching config files, OAuth, or the engine bootstrap.
     if cli.doctor {
         return Ok(doctor::run(cli.probe_mcp).await);
+    }
+
+    // Handle --build-info: print version + embedded source SHA and exit.
+    if cli.build_info {
+        println!(
+            "wayland-core {} (source {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("WAYLAND_SOURCE_SHA")
+        );
+        return Ok(ExitCode::SUCCESS);
     }
 
     // Handle --config-path

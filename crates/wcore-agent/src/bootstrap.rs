@@ -171,6 +171,13 @@ pub struct AgentBootstrap {
     /// shell tools. `None` (the default, and always the case for the local
     /// CLI / TUI / json-stream engines) leaves the full toolset intact.
     channel_tool_posture: Option<crate::channel_tools::ChannelToolScope>,
+    /// persona-profiles PR-4' — restrict this engine's toolset to a persona's
+    /// declared `allowed_tools`. `None` (every pre-existing caller) leaves the
+    /// toolset untouched. Applied with the SAME `registry.retain` mechanism the
+    /// channel posture uses, so a persona can only ever NARROW the toolset —
+    /// never widen it, and never grant auto-approval (that is
+    /// `[tools] allow_list`, a different and deliberately untouched knob).
+    persona_tool_allowlist: Option<Vec<String>>,
     /// wayland#551 — skip the config-declared MCP `connect_all` during
     /// build so slow/hung servers cannot gate boot. The caller owns
     /// connecting them afterwards (json-stream does it in the background
@@ -202,6 +209,7 @@ impl AgentBootstrap {
             without_channels: false,
             enable_inbound_dispatch: false,
             channel_tool_posture: None,
+            persona_tool_allowlist: None,
             defer_config_mcp: false,
             active_assistant: None,
         }
@@ -241,6 +249,22 @@ impl AgentBootstrap {
     /// [`crate::channel_tools::apply_posture`].
     pub fn channel_tool_posture(mut self, scope: crate::channel_tools::ChannelToolScope) -> Self {
         self.channel_tool_posture = Some(scope);
+        self
+    }
+
+    /// persona-profiles PR-4' — restrict the toolset to a persona's declared
+    /// `allowed_tools` (from its `AgentManifest`). An EMPTY list is treated as
+    /// "no restriction declared" and leaves the toolset intact.
+    ///
+    /// This can only NARROW the registry (it is a `retain`), so a persona can
+    /// never gain a tool the engine would not otherwise have. It deliberately
+    /// does NOT touch `[tools] allow_list` — that is the AUTO-APPROVE list, and
+    /// mapping a persona's capability list onto it would silently auto-approve
+    /// destructive tools (Bash/Write) instead of merely making them available.
+    pub fn tool_allowlist(mut self, allowed: Vec<String>) -> Self {
+        if !allowed.is_empty() {
+            self.persona_tool_allowlist = Some(allowed);
+        }
         self
     }
 
@@ -327,11 +351,13 @@ impl AgentBootstrap {
             let cache = Arc::new(std::sync::RwLock::new(
                 wcore_tools::file_cache::FileStateCache::new(&self.config.file_cache),
             ));
-            // Token-opt (diff-resend): enable client-side diff answers only on
-            // routes that optimize client-side. Router-optimized routes leave
-            // this off and send full reads. Set once here from the resolved
+            // Token-opt: enable OUTPUT-dedup (identical-tool-result backrefs)
+            // only on client-optimized routes; router-optimized routes defer
+            // output/wire dedup to the server. Set once here from the resolved
             // compat (config is moved into the engine below, so it must happen
-            // before construction).
+            // before construction). NOTE (#182): this no longer gates the read
+            // diff-resend — that is a context reduction the server can't do for
+            // us, so it runs on every route (see wcore-tools `read.rs`).
             if let Ok(mut c) = cache.write() {
                 c.set_optimize_reads(self.config.compat.input_optimization() == "client");
             }
@@ -1917,6 +1943,22 @@ impl AgentBootstrap {
         // below wcore-agent in the dep graph.
         registry.register(Box::new(wcore_tools::delegate::DelegateTool::new(spawner)));
 
+        // A1.9 — Forge: the session-level Anvil gated-forge tool (smart-loop
+        // front door; the tool description carries the routing law so the
+        // session model routes "iterate until verified" asks here). Gated on
+        // the `[anvil] enabled` kill-switch (ON by default; the tool is
+        // invocation-only and refuses without a real gate). The `[anvil]`
+        // block lives on ConfigFile, not resolved Config — load it here; a
+        // load failure just means no Forge tool this session (never fatal).
+        if let Ok(cf) = wcore_config::config::load_merged_config_file(None)
+            && cf.anvil.enabled
+        {
+            registry.register(Box::new(crate::orchestration::anvil::tool::ForgeTool::new(
+                cf.anvil,
+                self.config.clone(),
+            )));
+        }
+
         let plan_active_flag = Arc::new(AtomicBool::new(false));
         if self.config.plan.enabled {
             registry.register(Box::new(crate::plan::tools::EnterPlanModeTool::new(
@@ -1975,11 +2017,25 @@ impl AgentBootstrap {
         if self.config.builtin_tools.script.enabled {
             use wcore_tools::dispatcher::ToolDispatcher;
 
-            let dispatch_reg = build_script_dispatcher_registry(
+            let mut dispatch_reg = build_script_dispatcher_registry(
                 file_cache_for_script.clone(),
                 cwd_path,
                 self.config.builtin_tools.repomap.enabled,
             );
+            // MF2 (auditor): ScriptTool dispatches against THIS separate mini-registry,
+            // which `apply_posture` (run later, on the MAIN registry) never touches — so
+            // `Script([{tool:Grep}]/{tool:Glob})` would bypass the Full channel-remote
+            // drop of Grep/Glob (#232) and Git (MF1) entirely. Apply the SAME posture
+            // retain (and Workspace jail) to the mini-registry so it obeys the identical
+            // channel scope; a dropped tool then resolves to "not in registry". Never runs
+            // for a local CLI engine (no scope) — local Script keeps its full toolset.
+            if let Some(scope) = self.channel_tool_posture.as_ref() {
+                crate::channel_tools::apply_posture(
+                    &mut dispatch_reg,
+                    scope,
+                    wcore_tools::bash::platform_enforces_read_deny(),
+                );
+            }
             let shared = Arc::new(tokio::sync::RwLock::new(dispatch_reg));
             let dispatcher_handle = Arc::clone(&shared);
             // W8b.2.A — route through the ctx-aware closure shape so
@@ -2113,9 +2169,10 @@ impl AgentBootstrap {
         // (and, in `Workspace`, jail) the toolset BEFORE it moves into the
         // engine, so a remote sender cannot reach host filesystem/shell
         // tools. No-op for the local CLI/TUI/json-stream engines (posture
-        // `None`) and for `Full`. Runs after all built-in registration; MCP
-        // tools survive every posture, so post-construction MCP wiring is
-        // unaffected.
+        // `None`); for `Full` channel/remote it drops only the unconfined-search
+        // tools (Grep/Glob, #667 residual) and keeps the rest. Runs after all
+        // built-in registration; MCP tools survive every posture, so
+        // post-construction MCP wiring is unaffected.
         if let Some(scope) = self.channel_tool_posture.as_ref() {
             // Task 8 — bootstrap UX gate. Probe whether the platform's
             // sandbox backend enforces secret-read-deny; if not, suppress
@@ -2132,6 +2189,20 @@ impl AgentBootstrap {
             );
         }
 
+        // persona-profiles PR-4' — narrow the toolset to the selected persona's
+        // declared `allowed_tools`. Same `retain` mechanism as the channel
+        // posture above, and applied AFTER it so a persona composes with (and can
+        // only further narrow) any posture already in force — it can never
+        // re-widen a restricted channel engine.
+        if let Some(allowed) = &self.persona_tool_allowlist {
+            registry.retain(|t| allowed.iter().any(|a| a == t.name()));
+            tracing::info!(
+                target: "wcore_agent::bootstrap",
+                allowed = ?allowed,
+                "persona tool allowlist applied"
+            );
+        }
+
         // Every session gets a workspace policy so BashTool's OS sandbox is
         // rooted at the workspace (fixes the empty-allowlist / cwd:None pain
         // that broke local + desktop builds). A channel `Workspace` posture
@@ -2144,15 +2215,40 @@ impl AgentBootstrap {
             // (`Inherit`) only for a genuinely-local session — no channel posture
             // attached. Any channel path (including `Full`) is a remote sender and
             // stays on the fail-safe Deny default that `trusted_local` seeds.
-            let network = wcore_tools::workspace_policy::local_bash_network(
-                self.channel_tool_posture.is_some(),
+            let is_channel_remote = self.channel_tool_posture.is_some();
+            let network = wcore_tools::workspace_policy::local_bash_network(is_channel_remote);
+            let mut policy = wcore_tools::workspace_policy::WorkspacePolicy::trusted_local(
+                std::path::PathBuf::from(&self.workspace),
+            )
+            .with_network(network);
+            // #667 (Overwatch ruling, Sean-confirmed): a `Full`-posture channel /
+            // remote session lands on a `Trusted` policy but keeps host
+            // filesystem/shell tools, so it must still be denied the PROJECT's own
+            // committed secrets. A genuinely-local keyboard session (posture None)
+            // is EXEMPT: it may read its own `.env`.
+            //   * `with_project_secret_deny` adds the project secrets to
+            //     `secret_deny_paths()` → Bash's OS sandbox refuses them (bash.rs).
+            //   * the `SecretDenyFs` read-path guard (installed below, WITHOUT a
+            //     `SandboxedFs` jail so Full stays unconfined for non-secrets)
+            //     refuses `Read`/`Write`/`Edit` of the same project secrets.
+            // Gated on `Full` specifically (F6): `Workspace` posture already
+            // installed a `Contained` policy above; `Conversational` is stripped of
+            // every filesystem/shell tool, so its per-message workspace walk +
+            // guard would be dead weight with nothing to protect.
+            let is_full_posture = matches!(
+                self.channel_tool_posture.as_ref().map(|s| s.posture),
+                Some(wcore_channels::ChannelToolPosture::Full)
             );
-            let policy = std::sync::Arc::new(
-                wcore_tools::workspace_policy::WorkspacePolicy::trusted_local(
-                    std::path::PathBuf::from(&self.workspace),
-                )
-                .with_network(network),
-            );
+            if is_full_posture {
+                policy = policy.with_project_secret_deny();
+            }
+            let policy = std::sync::Arc::new(policy);
+            if is_full_posture {
+                registry.set_tool_vfs(std::sync::Arc::new(wcore_tools::vfs::SecretDenyFs::new(
+                    wcore_tools::vfs::RealFs,
+                    std::sync::Arc::clone(&policy),
+                )));
+            }
             registry.set_workspace_policy(policy);
         }
 
@@ -3342,6 +3438,38 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use wcore_plugin_api::{McpServerSpec, McpTransport};
+
+    /// MF2 (auditor): the ScriptTool dispatcher mini-registry must obey the SAME
+    /// channel posture as the main registry — otherwise `Script([{tool:Grep}])` /
+    /// `Script([{tool:Glob}])` bypasses the Full channel-remote drop (#232/MF1).
+    /// Build the mini-registry, apply the Full scope (as the bootstrap call site
+    /// now does when a channel scope is present), and assert the unconfined-search
+    /// builtins are gone while ordinary tools survive.
+    #[test]
+    fn script_dispatcher_registry_obeys_full_channel_posture() {
+        let mut reg = build_script_dispatcher_registry(None, std::path::Path::new("/tmp"), false);
+        assert!(
+            reg.get("Grep").is_some() && reg.get("Glob").is_some(),
+            "precondition: the raw mini-registry registers Grep/Glob"
+        );
+        let scope = crate::channel_tools::ChannelToolScope {
+            posture: wcore_channels::ChannelToolPosture::Full,
+            workspace_root: std::path::PathBuf::from("/tmp"),
+        };
+        crate::channel_tools::apply_posture(&mut reg, &scope, false);
+        assert!(
+            reg.get("Grep").is_none(),
+            "Full must drop Grep from the Script mini-registry (MF2)"
+        );
+        assert!(
+            reg.get("Glob").is_none(),
+            "Full must drop Glob from the Script mini-registry (MF2)"
+        );
+        assert!(
+            reg.get("Read").is_some() && reg.get("Bash").is_some(),
+            "non-search tools still survive in the Script mini-registry under Full"
+        );
+    }
 
     /// A4c: a declarative stdio MCP server whose command cannot be launched
     /// must fail the reachability gate. This is the only pre-connect skip on
